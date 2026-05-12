@@ -1,5 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -20,6 +21,7 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
+from vllm_omni.entrypoints.openai import session_state
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -30,6 +32,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
+    _TTSAudioCapture,
 )
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
@@ -986,6 +989,71 @@ class TestTTSMethods:
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
 
+    def test_build_tts_params_records_only_when_session_ok(self, speech_server, mocker: MockerFixture):
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
+        store = mocker.MagicMock()
+        mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.get_session_store",
+            return_value=store,
+        )
+
+        speech_server._fetch_session_context = mocker.MagicMock(
+            return_value=SimpleNamespace(use_icl=False, miss_reason="new_session", original_input="Hello")
+        )
+        params = speech_server._build_tts_params(req, session_id="session-1")
+        assert params["_session_ok"] == [True]
+        store.append_prior_text.assert_called_once_with("session-1", "Hello")
+
+        speech_server._fetch_session_context = mocker.MagicMock(
+            return_value=SimpleNamespace(use_icl=False, miss_reason="binding_race", original_input="Hello")
+        )
+        prior_calls = store.append_prior_text.call_count
+        params = speech_server._build_tts_params(req, session_id="session-1")
+        assert params["_session_ok"] == [False]
+        assert store.append_prior_text.call_count == prior_calls
+
+    def test_build_tts_params_session_icl_uses_baked_voice_anchor(self, speech_server, tmp_path, monkeypatch):
+        store = session_state.FileSessionStore(root=str(tmp_path / "sessions"))
+        monkeypatch.setattr(session_state, "_SINGLETON", store)
+        sig = session_state.compute_signature(voice="ryan", instruct="")
+        store.get_prior_codec_for_request("s1", sig)
+        store.append_prior_text("s1", "prior text")
+        store.append_codec_frames("s1", [[1, 2], [3, 4]])
+
+        req = OpenAICreateSpeechRequest(input="Hello", voice="ryan")
+        params = speech_server._build_tts_params(req, session_id="s1")
+
+        assert params["task_type"] == ["CustomVoice"]
+        assert params["non_streaming_mode"] == [True]
+        assert params["ref_text"] == ["prior text"]
+        vcp = params["voice_clone_prompt"][0]
+        assert "speaker_anchor" not in vcp
+        assert "ref_spk_embedding" not in vcp
+        assert vcp["ref_code"] == [[[1, 2], [3, 4]]]
+        assert vcp["icl_mode"] is True
+        assert vcp["code2wav_ref_context"] is False
+
+    def test_build_tts_params_session_icl_prefers_explicit_embedding(self, speech_server, tmp_path, monkeypatch):
+        store = session_state.FileSessionStore(root=str(tmp_path / "sessions"))
+        monkeypatch.setattr(session_state, "_SINGLETON", store)
+        sig = session_state.compute_signature(voice="ryan", instruct="")
+        store.get_prior_codec_for_request("s1", sig)
+        store.append_prior_text("s1", "prior text")
+        store.append_codec_frames("s1", [[1, 2]])
+
+        emb = [0.1] * 1024
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            voice="ryan",
+            task_type="Base",
+            speaker_embedding=emb,
+        )
+        params = speech_server._build_tts_params(req, session_id="s1")
+
+        vcp = params["voice_clone_prompt"][0]
+        assert vcp["ref_spk_embedding"] == emb
+        assert "speaker_anchor" not in vcp
+
     def test_load_supported_speakers(self, mocker: MockerFixture):
         """Test _load_supported_speakers."""
         mock_engine_client = mocker.MagicMock()
@@ -1936,6 +2004,73 @@ class TestWAVHeaderGeneration:
         assert subchunk2_size == 0xFFFFFFFF, "Subchunk2Size should be 0xFFFFFFFF for streaming"
 
 
+class TestTTSAudioCapture:
+    def test_tts_audio_capture_writes_audio_and_metadata(self, tmp_path):
+        req = OpenAICreateSpeechRequest(
+            input="Hello capture",
+            voice="maya_warm",
+            instructions="Warm and sincere.",
+            stream=True,
+            response_format="pcm",
+        )
+        capture = _TTSAudioCapture.create(
+            root=tmp_path,
+            request_id="speech-test",
+            request=req,
+            session_id="session-1",
+            response_format="pcm",
+            stream=True,
+            max_files=10,
+        )
+
+        capture.set_sample_rate(24000)
+        capture.append(b"\x01\x02" * 2400)
+        capture.close(completed=True)
+
+        assert capture.audio_path.read_bytes() == b"\x01\x02" * 2400
+        metadata = json.loads(capture.metadata_path.read_text())
+        assert metadata["request_id"] == "speech-test"
+        assert metadata["input"] == "Hello capture"
+        assert metadata["voice"] == "maya_warm"
+        assert metadata["instructions"] == "Warm and sincere."
+        assert metadata["session_id"] == "session-1"
+        assert metadata["continuity_requested"] is True
+        assert metadata["response_format"] == "pcm"
+        assert metadata["sample_rate"] == 24000
+        assert metadata["audio_bytes"] == 4800
+        assert metadata["duration_s"] == 0.1
+        assert metadata["completed"] is True
+        assert metadata["error"] is None
+        assert metadata["audio_file"] == capture.audio_path.name
+
+    def test_tts_audio_capture_wav_duration_excludes_header(self, tmp_path):
+        req = OpenAICreateSpeechRequest(
+            input="Hello wav capture",
+            voice="maya_warm",
+            instructions="Warm and sincere.",
+            stream=True,
+            response_format="wav",
+        )
+        capture = _TTSAudioCapture.create(
+            root=tmp_path,
+            request_id="speech-wav-test",
+            request=req,
+            session_id=None,
+            response_format="wav",
+            stream=True,
+            max_files=10,
+        )
+
+        capture.set_sample_rate(24000)
+        capture.append(b"0" * 44)
+        capture.append(b"\x01\x02" * 2400)
+        capture.close(completed=True)
+
+        metadata = json.loads(capture.metadata_path.read_text())
+        assert metadata["audio_bytes"] == 4844
+        assert metadata["duration_s"] == 0.1
+
+
 class _FakeFishTokenizer:
     def __init__(self):
         self._vocab = {
@@ -2422,6 +2557,37 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_registers_request_session_only_when_ok(
+        self,
+        qwen3_tts_server: OmniOpenAIServingSpeech,
+        mocker: MockerFixture,
+    ):
+        request = OpenAICreateSpeechRequest(input="Hello", task_type="CustomVoice")
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={
+                "_session_ok": [True],
+                "text": ["Hello"],
+                "task_type": ["CustomVoice"],
+            }
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=123)
+        register = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.register_request_session")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request, request_id="speech-1", session_id="session-1"))
+
+        register.assert_called_once_with("speech-1", "session-1")
+
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={
+                "_session_ok": [False],
+                "text": ["Hello"],
+                "task_type": ["CustomVoice"],
+            }
+        )
+        register.reset_mock()
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request, request_id="speech-2", session_id="session-1"))
+        register.assert_not_called()
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""

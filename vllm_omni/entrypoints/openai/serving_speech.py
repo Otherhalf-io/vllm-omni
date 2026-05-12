@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import copy
+import hashlib
 import io
 import json
 import math
@@ -8,6 +10,7 @@ import re
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -41,6 +44,12 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.entrypoints.openai.session_state import (
+    compute_signature,
+    drop_request_binding,
+    get_session_store,
+    register_request_session,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -57,6 +66,223 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
+
+_SESSION_HEADER = "X-Session-Id"
+_SESSION_CHARS_PER_CODEC_TOKEN = float(os.environ.get("VLLM_OMNI_SESSION_CHARS_PER_CODEC_TOKEN", "0.8"))
+_SESSION_CODE2WAV_REF_CONTEXT = os.environ.get("VLLM_OMNI_SESSION_CODE2WAV_REF_CONTEXT", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_SESSION_CONTEXT_MODE = os.environ.get("VLLM_OMNI_SESSION_CONTEXT_MODE", "talker_icl").strip().lower()
+if _SESSION_CONTEXT_MODE not in {"talker_icl", "code2wav"}:
+    raise ValueError(
+        f"VLLM_OMNI_SESSION_CONTEXT_MODE must be 'talker_icl' or 'code2wav', got {_SESSION_CONTEXT_MODE!r}"
+    )
+
+_TTS_CAPTURE_DIR_ENV = "VLLM_OMNI_TTS_CAPTURE_DIR"
+_TTS_CAPTURE_MAX_FILES_ENV = "VLLM_OMNI_TTS_CAPTURE_MAX_FILES"
+_TTS_CAPTURE_DEFAULT_MAX_FILES = 200
+_TTS_CAPTURE_PRUNE_SLACK = 25
+_TTS_CAPTURE_VERSION = 1
+_WAV_HEADER_BYTES = 44
+
+
+def _parse_tts_capture_max_files() -> int:
+    raw = os.environ.get(_TTS_CAPTURE_MAX_FILES_ENV, str(_TTS_CAPTURE_DEFAULT_MAX_FILES)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{_TTS_CAPTURE_MAX_FILES_ENV} must be an integer.") from None
+    if value <= 0:
+        raise ValueError(f"{_TTS_CAPTURE_MAX_FILES_ENV} must be > 0.")
+    return value
+
+
+def _safe_capture_component(value: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "-", value).strip("-")
+    return safe[:80] or "request"
+
+
+def _capture_response_extension(response_format: str) -> str:
+    fmt = response_format.strip().lower()
+    if fmt == "pcm":
+        return ".pcm"
+    if fmt == "wav":
+        return ".wav"
+    return ".bin"
+
+
+def _prune_tts_audio_captures(root: Path, *, max_files: int) -> None:
+    metadata_files = list(root.glob("*.json"))
+    if len(metadata_files) <= max_files + _TTS_CAPTURE_PRUNE_SLACK:
+        return
+    metadata_files.sort(key=lambda path: path.name)
+    excess = len(metadata_files) - max_files
+    if excess <= 0:
+        return
+    for metadata_path in metadata_files[:excess]:
+        stem = metadata_path.with_suffix("")
+        for suffix in (".json", ".pcm", ".wav", ".bin"):
+            try:
+                stem.with_suffix(suffix).unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.warning("Failed to prune TTS capture artifact %s", stem.with_suffix(suffix), exc_info=True)
+
+
+@dataclass
+class _TTSAudioCapture:
+    root: Path
+    request_id: str
+    metadata: dict[str, Any]
+    response_format: str
+    max_files: int
+    base_path: Path
+    audio_path: Path
+    metadata_path: Path
+    audio_bytes: int = 0
+    sample_rate: int = 24000
+    _metadata_written: bool = False
+    _audio_file: Any | None = field(default=None, init=False, repr=False)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        root: Path,
+        request_id: str,
+        request: OpenAICreateSpeechRequest,
+        session_id: str | None,
+        response_format: str,
+        stream: bool,
+        max_files: int,
+    ) -> "_TTSAudioCapture":
+        root.mkdir(parents=True, exist_ok=True)
+        created_at_unix_ms = int(time.time() * 1000)
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(created_at_unix_ms / 1000))
+        request_hash = hashlib.sha256(f"{request_id}\0{request.input}\0{created_at_unix_ms}".encode()).hexdigest()[:12]
+        base_name = f"{timestamp}-{_safe_capture_component(request_id)}-{request_hash}"
+        base_path = root / base_name
+        audio_path = base_path.with_suffix(_capture_response_extension(response_format))
+        metadata_path = base_path.with_suffix(".json")
+        metadata = {
+            "version": _TTS_CAPTURE_VERSION,
+            "created_at_unix_ms": created_at_unix_ms,
+            "request_id": request_id,
+            "input": request.input,
+            "voice": request.voice,
+            "instructions": request.instructions,
+            "model": request.model,
+            "response_format": response_format,
+            "stream": stream,
+            "session_id": session_id,
+            "continuity_requested": bool(session_id),
+            "sample_rate": 24000,
+            "audio_bytes": 0,
+            "duration_s": 0.0,
+            "completed": False,
+            "error": None,
+            "audio_file": audio_path.name,
+        }
+        return cls(
+            root=root,
+            request_id=request_id,
+            metadata=metadata,
+            response_format=response_format,
+            max_files=max_files,
+            base_path=base_path,
+            audio_path=audio_path,
+            metadata_path=metadata_path,
+        )
+
+    def set_sample_rate(self, sample_rate: int) -> None:
+        self.sample_rate = sample_rate
+
+    def append(self, chunk: bytes | str) -> None:
+        if not chunk:
+            return
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8")
+        if self._audio_file is None:
+            self._audio_file = self.audio_path.open("ab")
+        self._audio_file.write(chunk)
+        self.audio_bytes += len(chunk)
+
+    def _duration_audio_bytes(self) -> int:
+        if self.response_format.strip().lower() == "wav":
+            return max(0, self.audio_bytes - _WAV_HEADER_BYTES)
+        return self.audio_bytes
+
+    def _close_audio_file(self) -> None:
+        if self._audio_file is not None:
+            self._audio_file.close()
+            self._audio_file = None
+
+    def close(self, *, completed: bool, error: str | None = None) -> None:
+        self._close_audio_file()
+        if self._metadata_written:
+            return
+        bytes_per_sample = 2
+        duration_audio_bytes = self._duration_audio_bytes()
+        self.metadata.update(
+            {
+                "sample_rate": self.sample_rate,
+                "audio_bytes": self.audio_bytes,
+                "duration_s": duration_audio_bytes / (self.sample_rate * bytes_per_sample)
+                if self.sample_rate > 0
+                else 0.0,
+                "completed": completed,
+                "error": error,
+            }
+        )
+        self.metadata_path.write_text(json.dumps(self.metadata, indent=2, sort_keys=True) + "\n")
+        self._metadata_written = True
+        _prune_tts_audio_captures(self.root, max_files=self.max_files)
+
+
+def _create_tts_audio_capture(
+    *,
+    request_id: str,
+    request: OpenAICreateSpeechRequest,
+    session_id: str | None,
+    response_format: str,
+    stream: bool,
+) -> _TTSAudioCapture | None:
+    root_raw = os.environ.get(_TTS_CAPTURE_DIR_ENV, "").strip()
+    if not root_raw:
+        return None
+    max_files = _parse_tts_capture_max_files()
+    return _TTSAudioCapture.create(
+        root=Path(root_raw),
+        request_id=request_id,
+        request=request,
+        session_id=session_id,
+        response_format=response_format,
+        stream=stream,
+        max_files=max_files,
+    )
+
+
+def _tts_params_use_icl(tts_params: dict[str, Any]) -> bool:
+    prompt = tts_params.get("voice_clone_prompt")
+    if not isinstance(prompt, list) or not prompt:
+        return False
+    first = prompt[0]
+    return isinstance(first, dict) and first.get("icl_mode") is True
+
+
+@dataclass
+class _SessionContext:
+    prior_codec: list[list[int]]
+    prior_texts: list[str]
+    original_input: str
+    use_icl: bool
+    miss_reason: str
+    speaker_anchor_kind: str | None = None
+
 
 # TTS Configuration
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
@@ -1518,6 +1744,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id: str,
         response_format: str = "pcm",
         raw_request: Request | None = None,
+        capture: _TTSAudioCapture | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -1577,6 +1804,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                             "First audio chunk must include sample rate metadata for WAV streaming"
                         )
                         wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
+                        if capture is not None:
+                            capture.set_sample_rate(sample_rate_val)
+                            capture.append(wav_header)
                         yield wav_header
                         first_chunk = False
 
@@ -1589,11 +1819,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         stream_format="audio",
                         base64_encode=False,
                     )
-                    yield self.create_audio(audio_obj).audio_data
+                    audio_bytes = self.create_audio(audio_obj).audio_data
+                    if capture is not None:
+                        capture.set_sample_rate(sample_rate_val)
+                        capture.append(audio_bytes)
+                    yield audio_bytes
+            if capture is not None:
+                capture.close(completed=True)
         except asyncio.CancelledError:
+            if capture is not None:
+                capture.close(completed=False, error="cancelled")
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except EngineDeadError as e:
+            if capture is not None:
+                capture.close(completed=False, error=str(e))
             logger.error(
                 "EngineDeadError during streaming speech for %s: %s",
                 request_id,
@@ -1607,6 +1847,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 )
             raise
         except Exception as e:
+            if capture is not None:
+                capture.close(completed=False, error=str(e))
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
 
@@ -1637,7 +1879,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
 
-    def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+    def _build_tts_params(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         """Build TTS parameters from request.
 
         Processes each parameter if present, skips if not.
@@ -1656,6 +1903,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return params
 
         params: dict[str, Any] = {}
+        session_ctx = self._fetch_session_context(request, session_id)
+        should_record = session_ctx is not None and (session_ctx.use_icl or session_ctx.miss_reason == "new_session")
+        params["_session_ok"] = [should_record]
 
         # Text content (always required)
         params["text"] = [request.input]
@@ -1746,7 +1996,124 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if params["task_type"][0] == "VoiceDesign":
             params["non_streaming_mode"] = [True]
 
+        if session_ctx is not None and session_ctx.use_icl:
+            use_base_icl = request.speaker_embedding is not None or params["task_type"][0] == "Base"
+            use_code2wav_context = (
+                _SESSION_CONTEXT_MODE == "code2wav" and not use_base_icl and params["task_type"][0] == "CustomVoice"
+            )
+            logger.info(
+                "[session_state] session=%s %s path (task=%s, codec frames=%d, prior turns=%d, prior-text chars=%d)",
+                session_id,
+                "Code2Wav context" if use_code2wav_context else "ICL",
+                "Base" if use_base_icl else "CustomVoice",
+                len(session_ctx.prior_codec),
+                len(session_ctx.prior_texts),
+                sum(len(t) for t in session_ctx.prior_texts),
+            )
+            if use_code2wav_context:
+                prompt = {
+                    "ref_code": [list(session_ctx.prior_codec)],
+                    "code2wav_context_only": True,
+                }
+            else:
+                if use_base_icl:
+                    params["task_type"] = ["Base"]
+                    params["x_vector_only_mode"] = [False]
+                params["non_streaming_mode"] = [True]
+                params["ref_text"] = [" ".join(session_ctx.prior_texts)]
+                prompt = {
+                    "ref_code": [list(session_ctx.prior_codec)],
+                    "icl_mode": True,
+                    "code2wav_ref_context": _SESSION_CODE2WAV_REF_CONTEXT,
+                }
+                if request.speaker_embedding is not None:
+                    prompt["ref_spk_embedding"] = list(request.speaker_embedding)
+                else:
+                    voice_lower = request.voice.lower() if request.voice else ""
+                    if use_base_icl and voice_lower and voice_lower not in self.uploaded_speakers:
+                        prompt["speaker_anchor"] = {
+                            "kind": "voice",
+                            "voice": request.voice,
+                        }
+            params["voice_clone_prompt"] = [prompt]
+
+        if should_record:
+            try:
+                get_session_store().append_prior_text(session_id, session_ctx.original_input)
+            except Exception:
+                logger.warning("[session_state] append_prior_text failed", exc_info=True)
+
         return params
+
+    def _fetch_session_context(
+        self,
+        request: OpenAICreateSpeechRequest,
+        session_id: str | None,
+    ) -> _SessionContext | None:
+        """Load prior state for a session-tagged Qwen3-TTS request."""
+        if not session_id:
+            return None
+        try:
+            signature = compute_signature(
+                voice=request.voice,
+                instruct=request.instructions or "",
+            )
+            new_prompt_est = max(40, len(request.input) // 3 + 40)
+            prior_context = get_session_store().get_prior_context_for_request(
+                session_id,
+                signature,
+                new_prompt_est=new_prompt_est,
+            )
+            prior_codec = prior_context.codec_tokens
+            prior_texts = prior_context.prior_texts
+            original_input = request.input.strip()
+        except Exception:
+            logger.warning(
+                "[session_state] session=%s lookup failed; running stateless",
+                session_id,
+                exc_info=True,
+            )
+            return None
+
+        if request.speaker_embedding is not None:
+            speaker_anchor_kind = "request_embedding"
+        elif request.voice:
+            speaker_anchor_kind = "voice"
+        else:
+            speaker_anchor_kind = None
+
+        use_icl = bool(prior_codec and prior_texts and speaker_anchor_kind is not None)
+        if use_icl:
+            miss_reason = "ok"
+        elif not prior_texts and not prior_codec:
+            miss_reason = "new_session"
+        elif prior_texts and not prior_codec:
+            logger.warning(
+                "[session_state] session=%s MISS reason=binding_race (prior_turns=%d but no captured codec yet)",
+                session_id,
+                len(prior_texts),
+            )
+            miss_reason = "binding_race"
+        elif speaker_anchor_kind is None:
+            logger.warning(
+                "[session_state] session=%s MISS reason=no_speaker_anchor (prior_turns=%d, prior_codec_frames=%d)",
+                session_id,
+                len(prior_texts),
+                len(prior_codec),
+            )
+            miss_reason = "no_speaker_anchor"
+        else:
+            logger.warning("[session_state] session=%s MISS reason=unknown", session_id)
+            miss_reason = "unknown"
+
+        return _SessionContext(
+            prior_codec=prior_codec,
+            prior_texts=prior_texts,
+            original_input=original_input,
+            use_icl=use_icl,
+            miss_reason=miss_reason,
+            speaker_anchor_kind=speaker_anchor_kind,
+        )
 
     # ---- Voxtral TTS helpers ----
 
@@ -1922,7 +2289,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
     ) -> list:
         """Set min/max tokens from tokenized text length (ratios target tokens, not chars)."""
-        import copy
 
         from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
         from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
@@ -2007,6 +2373,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         request_id: str | None = None,
+        session_id: str | None = None,
     ) -> tuple[str, Any, dict[str, Any]]:
         if self.engine_client.errored:
             raise self.engine_client.dead_error
@@ -2106,7 +2473,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
             else:
-                tts_params = self._build_tts_params(request)
+                tts_params = self._build_tts_params(request, session_id=session_id)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
                 # to [[wav_list, sr]] so the model doesn't re-decode base64.
                 ref_audio_source = request.ref_audio
@@ -2226,6 +2593,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list=sampling_params_list,
             output_modalities=["audio"],
         )
+        if session_id and tts_params.get("_session_ok", [False])[0]:
+            register_request_session(request_id, session_id)
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(self, generator, request_id: str):
@@ -2237,9 +2606,91 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async for chunk in self._generate_audio_chunks(generator, request_id, response_format="pcm"):
             yield chunk
 
-    async def _iter_pcm_audio_bytes(self, request: OpenAICreateSpeechRequest):
+    async def _generate_audio_chunks_with_empty_retry(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        request_id: str | None,
+        session_id: str | None,
+        response_format: str,
+        raw_request: Request | None = None,
+    ):
+        request_id, generator, tts_params = await self._prepare_speech_generation(
+            request,
+            request_id=request_id,
+            session_id=session_id,
+        )
+        uses_icl = bool(session_id) and _tts_params_use_icl(tts_params)
+        emitted_chunk = False
+        capture = _create_tts_audio_capture(
+            request_id=request_id,
+            request=request,
+            session_id=session_id,
+            response_format=response_format,
+            stream=True,
+        )
+        async for chunk in self._generate_audio_chunks(
+            generator,
+            request_id,
+            response_format,
+            raw_request=raw_request,
+            capture=capture,
+        ):
+            emitted_chunk = True
+            yield chunk
+
+        if emitted_chunk:
+            return
+
+        drop_request_binding(request_id)
+        if not uses_icl:
+            raise ValueError("TTS model produced empty audio.")
+
+        get_session_store().reset_to_fresh(
+            session_id,
+            reason="EMPTY-AUDIO-RESET",
+        )
+        logger.warning(
+            "[session_state] session=%s EMPTY-AUDIO-RESET (empty stream); resetting session and retrying stateless",
+            session_id,
+        )
+
+        retry_request_id, retry_generator, retry_tts_params = await self._prepare_speech_generation(
+            request,
+            session_id=session_id,
+        )
+        retry_uses_icl = _tts_params_use_icl(retry_tts_params)
+        retry_emitted_chunk = False
+        retry_capture = _create_tts_audio_capture(
+            request_id=retry_request_id,
+            request=request,
+            session_id=session_id,
+            response_format=response_format,
+            stream=True,
+        )
+        async for chunk in self._generate_audio_chunks(
+            retry_generator,
+            retry_request_id,
+            response_format,
+            raw_request=raw_request,
+            capture=retry_capture,
+        ):
+            retry_emitted_chunk = True
+            yield chunk
+        if retry_emitted_chunk:
+            return
+        if retry_uses_icl:
+            drop_request_binding(retry_request_id)
+        raise ValueError("TTS model produced empty audio.")
+
+    async def _iter_pcm_audio_bytes(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        session_id: str | None = None,
+    ):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, _ = await self._prepare_speech_generation(request, session_id=session_id)
         async for chunk in self._generate_pcm_chunks(generator, request_id):
             yield chunk
 
@@ -2248,8 +2699,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request: OpenAICreateSpeechRequest,
         base64_encode: bool = False,
         request_id: str | None = None,
+        session_id: str | None = None,
+        capture: _TTSAudioCapture | None = None,
     ) -> tuple[bytes | str, str]:
-        request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+        request_id, generator, _ = await self._prepare_speech_generation(
+            request,
+            request_id=request_id,
+            session_id=session_id,
+        )
 
         # MOSS-TTS-Nano emits delta chunks per yield (single-stage,
         # async_chunk=false). The engine surfaces each yield as its own
@@ -2344,6 +2801,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             base64_encode=base64_encode,
         )
         audio_response: AudioResponse = self.create_audio(audio_obj)
+        if capture is not None:
+            capture.set_sample_rate(sample_rate)
+            capture.append(audio_response.audio_data)
+            capture.close(completed=True)
         return audio_response.audio_data, audio_response.media_type
 
     async def _create_diffusion_speech(
@@ -2513,6 +2974,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request_id=request_id,
             )
 
+        session_id: str | None = None
+        if raw_request is not None:
+            try:
+                session_id = raw_request.headers.get(_SESSION_HEADER) or None
+            except Exception:
+                session_id = None
+
         try:
             if request.stream:
                 # Determine response format and media type for streaming
@@ -2533,18 +3001,36 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
-                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
                 return StreamingResponse(
-                    self._generate_audio_chunks(
-                        generator,
-                        request_id,
-                        response_format,
+                    self._generate_audio_chunks_with_empty_retry(
+                        request,
+                        request_id=request_id,
+                        session_id=session_id,
+                        response_format=response_format,
                         raw_request=raw_request,
                     ),
                     media_type=media_type,
                 )
 
-            audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
+            response_format = (request.response_format or "wav").lower()
+            capture = _create_tts_audio_capture(
+                request_id=request_id,
+                request=request,
+                session_id=session_id,
+                response_format=response_format,
+                stream=False,
+            )
+            try:
+                audio_bytes, media_type = await self._generate_audio_bytes(
+                    request,
+                    request_id=request_id,
+                    session_id=session_id,
+                    capture=capture,
+                )
+            except Exception as e:
+                if capture is not None:
+                    capture.close(completed=False, error=str(e))
+                raise
             return Response(content=audio_bytes, media_type=media_type)
 
         except asyncio.CancelledError:

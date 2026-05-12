@@ -324,6 +324,24 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
+        # Notify the optional cross-request session store of the codec frames
+        # emitted for this request before dropping them. Requests without an
+        # API-server request->session binding short-circuit inside
+        # ``on_request_complete``.
+        frames = self.code_prompt_token_ids.get(external_req_id)
+        if frames:
+            try:
+                from vllm_omni.entrypoints.openai.session_state import (
+                    on_request_complete,
+                )
+
+                on_request_complete(external_req_id, frames)
+            except Exception:
+                logger.warning(
+                    "session_state.on_request_complete failed",
+                    exc_info=True,
+                )
+
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
@@ -331,6 +349,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+        try:
+            from vllm_omni.entrypoints.openai.session_state import (
+                drop_request_binding,
+            )
+
+            drop_request_binding(external_req_id)
+        except Exception:
+            pass
 
     def cleanup(
         self,

@@ -1408,6 +1408,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_code_t = ref_code
             elif isinstance(ref_code, np.ndarray):
                 ref_code_t = torch.from_numpy(ref_code)
+            elif isinstance(ref_code, list) and ref_code and isinstance(ref_code[0], list):
+                try:
+                    ref_code_t = torch.tensor(ref_code, dtype=torch.long)
+                except Exception:
+                    logger.warning(
+                        "ref_code list-of-lists -> tensor conversion failed; "
+                        "dropping session-prior codec for this turn",
+                        exc_info=True,
+                    )
+                    ref_code_t = None
             if isinstance(ref_code_t, torch.Tensor):
                 if ref_code_t.ndim == 3:
                     ref_code_t = ref_code_t[0]
@@ -1555,7 +1565,61 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_prefix = codec_prefix + codec_input[:, :-1]
             talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
 
-            if non_streaming_mode:
+            voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+            in_context_mode = False
+            if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
+                icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
+                in_context_mode = icl_flag is True
+
+            ref_code_t = None
+            if in_context_mode:
+                ref_code = _as_singleton(voice_clone_prompt.get("ref_code")) if voice_clone_prompt is not None else None
+                if isinstance(ref_code, torch.Tensor):
+                    ref_code_t = ref_code
+                elif isinstance(ref_code, np.ndarray):
+                    ref_code_t = torch.from_numpy(ref_code)
+                elif isinstance(ref_code, list) and ref_code and isinstance(ref_code[0], list):
+                    try:
+                        ref_code_t = torch.tensor(ref_code, dtype=torch.long)
+                    except Exception:
+                        logger.warning(
+                            "CustomVoice ref_code list-of-lists -> tensor conversion failed; "
+                            "dropping session-prior codec for this turn",
+                            exc_info=True,
+                        )
+                        ref_code_t = None
+                if isinstance(ref_code_t, torch.Tensor):
+                    if ref_code_t.ndim == 3:
+                        ref_code_t = ref_code_t[0]
+                    ref_code_t = ref_code_t.to(device=input_ids.device, dtype=torch.long)
+                    ref_code_len = int(ref_code_t.shape[0])
+                    ref_code_prompt = ref_code_t
+                else:
+                    raise ValueError("CustomVoice ICL requires `voice_clone_prompt.ref_code`.")
+
+            if in_context_mode:
+                ref_ids = _to_long_tensor(info_dict.get("ref_ids"), device=input_ids.device)
+                if ref_ids is None and voice_clone_prompt is not None:
+                    ref_ids = _to_long_tensor(
+                        voice_clone_prompt.get("ref_ids") or voice_clone_prompt.get("ref_id"), device=input_ids.device
+                    )
+                if ref_ids is None:
+                    ref_text = _as_singleton(info_dict.get("ref_text"))
+                    if not isinstance(ref_text, str) or not ref_text.strip():
+                        raise ValueError("CustomVoice ICL requires `ref_text` or tokenized `ref_ids`.")
+                    ref_ids = tok(self._build_ref_text(ref_text), return_tensors="pt", padding=False)["input_ids"].to(
+                        device=input_ids.device
+                    )
+                icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
+                    text_id=input_ids[:, 3:-5],
+                    ref_id=ref_ids[:, 3:-2],
+                    ref_code=ref_code_t,
+                    tts_pad_embed=tts_pad_embed,
+                    tts_eos_embed=tts_eos_embed,
+                    non_streaming_mode=non_streaming_mode,
+                )
+                talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
+            elif non_streaming_mode:
                 text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
                 pad_ids = torch.full(
