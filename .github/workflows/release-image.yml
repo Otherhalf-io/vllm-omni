@@ -59,13 +59,15 @@ jobs:
           latest_tag="latest-${{ inputs.channel }}"
           image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
 
-          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "immutable_tag=${immutable_tag}" >> "$GITHUB_OUTPUT"
-          echo "upstream_eval_tag=${upstream_eval_tag}" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
-          echo "immutable_image=${image}:${immutable_tag}" >> "$GITHUB_OUTPUT"
-          echo "upstream_eval_image=${image}:${upstream_eval_tag}" >> "$GITHUB_OUTPUT"
-          echo "latest_image=${image}:${latest_tag}" >> "$GITHUB_OUTPUT"
+          {
+            echo "short_sha=${short_sha}"
+            echo "immutable_tag=${immutable_tag}"
+            echo "upstream_eval_tag=${upstream_eval_tag}"
+            echo "latest_tag=${latest_tag}"
+            echo "immutable_image=${image}:${immutable_tag}"
+            echo "upstream_eval_image=${image}:${upstream_eval_tag}"
+            echo "latest_image=${image}:${latest_tag}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -97,14 +99,16 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## vllm-omni image release" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| field | value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| channel | \`${{ inputs.channel }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ref | \`${{ inputs.ref }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| short SHA | \`${{ steps.tags.outputs.short_sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| base image | \`${{ inputs.base_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| immutable image | \`${{ steps.tags.outputs.immutable_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| upstream eval image | \`${{ steps.tags.outputs.upstream_eval_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| latest alias | \`${{ steps.tags.outputs.latest_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## vllm-omni image release"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| channel | \`${{ inputs.channel }}\` |"
+            echo "| ref | \`${{ inputs.ref }}\` |"
+            echo "| short SHA | \`${{ steps.tags.outputs.short_sha }}\` |"
+            echo "| base image | \`${{ inputs.base_image }}\` |"
+            echo "| immutable image | \`${{ steps.tags.outputs.immutable_image }}\` |"
+            echo "| upstream eval image | \`${{ steps.tags.outputs.upstream_eval_image }}\` |"
+            echo "| latest alias | \`${{ steps.tags.outputs.latest_image }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
