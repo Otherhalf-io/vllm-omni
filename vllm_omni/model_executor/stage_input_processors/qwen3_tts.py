@@ -12,6 +12,14 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
     to_dict,
 )
+from vllm_omni.model_executor.models.qwen3_tts.continuity import (
+    CONTINUITY_CODE2WAV_CONTEXT,
+    additional_value_from_request,
+    continuity_cache_for_transfer_manager,
+    continuity_mode_enabled,
+    normalize_cache_key,
+    normalize_codec_frames,
+)
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     max_ic_for_chunk_size,
@@ -249,6 +257,37 @@ def talker2code2wav_async_chunk(
         window_frames = ref_frames + window_frames
         left_context_size += len(ref_frames)
 
+    continuity_cache_key = normalize_cache_key(additional_value_from_request(request, "continuity_cache_key"))
+    use_code2wav_context = continuity_mode_enabled(
+        additional_value_from_request(request, "continuity_mode"),
+        CONTINUITY_CODE2WAV_CONTEXT,
+    )
+    context_frames_tensor = None
+    if use_code2wav_context:
+        if continuity_cache_key is None:
+            raise ValueError("code2wav_context continuity requires continuity_cache_key")
+        request_context_cache = getattr(transfer_manager, "_qwen3_tts_continuity_context_by_request", None)
+        if request_context_cache is None:
+            request_context_cache = {}
+            transfer_manager._qwen3_tts_continuity_context_by_request = request_context_cache
+        if request_id not in request_context_cache:
+            request_context_cache[request_id] = continuity_cache_for_transfer_manager(transfer_manager).get(
+                continuity_cache_key
+            )
+        context_frames_tensor = normalize_codec_frames(request_context_cache.get(request_id))
+        if context_frames_tensor is not None:
+            context_frames = context_frames_tensor.cpu().tolist()
+            window_frames = context_frames + window_frames
+            left_context_size += len(context_frames)
+            if not getattr(transfer_manager, "_qwen3_tts_logged_code2wav_context", False):
+                transfer_manager._qwen3_tts_logged_code2wav_context = True
+                logger.info(
+                    "Qwen3-TTS Code2Wav continuity context active: context_frames=%d request_id=%s cache_key=%s",
+                    len(context_frames),
+                    request_id,
+                    continuity_cache_key,
+                )
+
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
     code_predictor_codes = torch.tensor(
@@ -256,7 +295,7 @@ def talker2code2wav_async_chunk(
         dtype=torch.long,
     )
 
-    return OmniPayloadStruct(
+    payload = OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=MetaStruct(
             left_context_size=left_context_size,
@@ -265,3 +304,16 @@ def talker2code2wav_async_chunk(
         speaker=extract_speaker_from_request(request),
         language=extract_language_from_request(request),
     )
+    if finished and continuity_cache_key is not None:
+        cache = continuity_cache_for_transfer_manager(transfer_manager)
+        stored = cache.put(continuity_cache_key, transfer_manager.code_prompt_token_ids[request_id])
+        if not stored:
+            logger.warning(
+                "Qwen3-TTS continuity cache skipped malformed or empty generated codes request_id=%s cache_key=%s",
+                request_id,
+                continuity_cache_key,
+            )
+        request_context_cache = getattr(transfer_manager, "_qwen3_tts_continuity_context_by_request", None)
+        if isinstance(request_context_cache, dict):
+            request_context_cache.pop(request_id, None)
+    return payload

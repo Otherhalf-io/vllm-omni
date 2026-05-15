@@ -81,6 +81,25 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    continuity_mode: str | None = Field(
+        default=None,
+        description=(
+            "Qwen3-TTS continuity primitive to enable for this request. Supported values are "
+            "'talker_icl', 'code2wav_context', and 'talker_icl+code2wav_context'."
+        ),
+    )
+    continuity_ref_text: str | None = Field(
+        default=None,
+        description="Qwen3-TTS static talker ICL reference transcript.",
+    )
+    continuity_ref_code: list[list[int]] | None = Field(
+        default=None,
+        description="Qwen3-TTS static talker ICL reference codec frames shaped [frames, quantizers].",
+    )
+    continuity_cache_key: str | None = Field(
+        default=None,
+        description="Opaque Qwen3-TTS continuity cache key used for Code2Wav left context.",
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
@@ -100,11 +119,62 @@ class OpenAICreateSpeechRequest(BaseModel):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
         return v
 
+    @field_validator("continuity_mode")
+    @classmethod
+    def validate_continuity_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        allowed = ("off", "talker_icl", "code2wav_context", "talker_icl+code2wav_context")
+        if v not in allowed:
+            raise ValueError(f"Unsupported continuity_mode value: {v!r}; expected one of: {', '.join(allowed)}")
+        return v
+
+    @field_validator("continuity_ref_code", mode="before")
+    @classmethod
+    def validate_continuity_code(cls, v: Any | None) -> Any | None:
+        if v is None:
+            return None
+        if not isinstance(v, list) or not v:
+            raise ValueError("continuity codec frames must be non-empty when provided")
+        if not all(isinstance(row, list) for row in v):
+            raise ValueError("continuity codec frames must be shaped [frames, quantizers]")
+        row_width = len(v[0])
+        if row_width == 0:
+            raise ValueError("continuity codec frames must have at least one quantizer")
+        for row in v:
+            if len(row) != row_width:
+                raise ValueError("continuity codec frames must be rectangular")
+            if any(not isinstance(code, int) or isinstance(code, bool) for code in row):
+                raise ValueError("continuity codec values must be integers")
+        return v
+
+    @field_validator("continuity_cache_key")
+    @classmethod
+    def validate_continuity_cache_key(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        key = v.strip()
+        if not key:
+            raise ValueError("'continuity_cache_key' must be non-empty when provided")
+        return key
+
     @model_validator(mode="after")
     def validate_embedding_constraints(self) -> "OpenAICreateSpeechRequest":
         if self.speaker_embedding is not None:
             if self.ref_audio is not None:
                 raise ValueError("'speaker_embedding' and 'ref_audio' are mutually exclusive")
+        return self
+
+    @model_validator(mode="after")
+    def validate_continuity_constraints(self) -> "OpenAICreateSpeechRequest":
+        modes = set(self.continuity_mode.split("+")) if self.continuity_mode else set()
+        if "talker_icl" in modes:
+            if not self.continuity_ref_text or not self.continuity_ref_text.strip():
+                raise ValueError("'continuity_ref_text' is required when continuity_mode includes 'talker_icl'")
+            if self.continuity_ref_code is None:
+                raise ValueError("'continuity_ref_code' is required when continuity_mode includes 'talker_icl'")
+        if "code2wav_context" in modes and self.continuity_cache_key is None:
+            raise ValueError("'continuity_cache_key' is required when continuity_mode includes 'code2wav_context'")
         return self
 
     @model_validator(mode="after")

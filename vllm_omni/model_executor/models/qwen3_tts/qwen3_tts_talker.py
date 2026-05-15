@@ -28,6 +28,13 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_tts.continuity import (
+    CONTINUITY_TALKER_ICL,
+    codec_frame_count,
+    continuity_mode_enabled,
+    normalize_codec_frames,
+    unwrap_singleton,
+)
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -433,6 +440,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
         )
+        self._qwen3_tts_logged_talker_continuity = False
 
     # -------------------- vLLM required hooks --------------------
 
@@ -792,7 +800,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
 
         if task_type in ("CustomVoice", "VoiceDesign"):
-            if non_streaming_mode:
+            use_talker_icl = task_type == "CustomVoice" and continuity_mode_enabled(
+                info.get("continuity_mode"), CONTINUITY_TALKER_ICL
+            )
+            continuity_ref_text = unwrap_singleton(info.get("continuity_ref_text"))
+            continuity_ref_code_len = codec_frame_count(info.get("continuity_ref_code"))
+            if use_talker_icl:
+                if not isinstance(continuity_ref_text, str) or not continuity_ref_text.strip():
+                    raise ValueError("talker_icl continuity requires continuity_ref_text")
+                if not continuity_ref_code_len:
+                    raise ValueError("talker_icl continuity requires continuity_ref_code")
+                ref_text_ids = tokenize_prompt(
+                    Qwen3TTSTalkerForConditionalGeneration._build_ref_text(continuity_ref_text)
+                )
+                ref_id_len = max(0, len(ref_text_ids) - 5)
+                text_id_len = max(0, int(assistant_len) - 8)
+                text_lens = ref_id_len + text_id_len + 1
+                codec_lens = 1 + int(continuity_ref_code_len)
+                prompt_len += text_lens + codec_lens if non_streaming_mode else codec_lens
+            elif non_streaming_mode:
                 # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
                 prompt_len += assistant_len - 6
             else:
@@ -1047,7 +1073,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
                 # Otherwise, recurse into elements (but avoid descending into huge numeric lists).
                 for item in obj_list:
-                    if isinstance(item, list) and len(item) >= 512 and _is_number_sequence(item):  # type: ignore[arg-type]
+                    if (
+                        isinstance(item, list) and len(item) >= 512 and _is_number_sequence(item)  # type: ignore[arg-type]
+                    ):
                         wav_candidates.append(item)
                         continue
                     _scan(item, depth + 1)
@@ -1331,19 +1359,24 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return x
 
         def _to_long_tensor(x: object, *, device: torch.device) -> torch.Tensor | None:
-            x = _as_singleton(x)
+            x = unwrap_singleton(x)
             if x is None:
                 return None
             if isinstance(x, torch.Tensor):
                 t = x
             elif isinstance(x, np.ndarray):
                 t = torch.from_numpy(x)
-            elif isinstance(x, list) and x and all(isinstance(v, (int, np.integer)) for v in x):
-                t = torch.tensor(x, dtype=torch.long)
+            elif isinstance(x, list) and x:
+                try:
+                    t = torch.tensor(x, dtype=torch.long)
+                except (TypeError, ValueError):
+                    return None
             else:
                 return None
             if t.ndim == 1:
                 t = t.unsqueeze(0)
+            if t.ndim != 2:
+                return None
             return t.to(device=device, dtype=torch.long)
 
         def _normalize_voice_clone_prompt(raw: object) -> dict[str, object] | None:
@@ -1555,7 +1588,37 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_prefix = codec_prefix + codec_input[:, :-1]
             talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
 
-            if non_streaming_mode:
+            use_talker_icl = continuity_mode_enabled(info_dict.get("continuity_mode"), CONTINUITY_TALKER_ICL)
+            continuity_ref_code = normalize_codec_frames(info_dict.get("continuity_ref_code"), device=input_ids.device)
+            continuity_ref_text = unwrap_singleton(info_dict.get("continuity_ref_text"))
+
+            if use_talker_icl:
+                if not isinstance(continuity_ref_text, str) or not continuity_ref_text.strip():
+                    raise ValueError("talker_icl continuity requires continuity_ref_text")
+                if continuity_ref_code is None:
+                    raise ValueError("talker_icl continuity requires continuity_ref_code")
+                ref_ids = tok(
+                    self._build_ref_text(continuity_ref_text),
+                    return_tensors="pt",
+                    padding=False,
+                )["input_ids"].to(device=input_ids.device)
+                icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
+                    text_id=input_ids[:, 3:-5],
+                    ref_id=ref_ids[:, 3:-2],
+                    ref_code=continuity_ref_code,
+                    tts_pad_embed=tts_pad_embed,
+                    tts_eos_embed=tts_eos_embed,
+                    non_streaming_mode=non_streaming_mode,
+                )
+                talker_prompt = torch.cat([talker_prompt, icl_input_embed], dim=1)
+                if not self._qwen3_tts_logged_talker_continuity:
+                    self._qwen3_tts_logged_talker_continuity = True
+                    logger.info(
+                        "Qwen3-TTS talker continuity ICL active: ref_frames=%d speaker=%s",
+                        int(continuity_ref_code.shape[0]),
+                        speaker,
+                    )
+            elif non_streaming_mode:
                 text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
                 text_all = torch.cat([text_all, tts_eos_embed], dim=1)
                 pad_ids = torch.full(
