@@ -299,6 +299,73 @@ def test_get_continuity_anchor_uses_env_registry_and_rejects_unknown(tmp_path, m
     reset_continuity_anchors_for_test()
 
 
+def test_anchor_lookup_telemetry_records_anchor_metadata(tmp_path, monkeypatch):
+    spans = []
+
+    class FakeSpan:
+        def __init__(self, name, attributes):
+            self.name = name
+            self.attributes = dict(attributes or {})
+
+        def __enter__(self):
+            spans.append(self)
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return False
+
+        def is_recording(self):
+            return True
+
+        def set_attribute(self, key, value):
+            self.attributes[key] = value
+
+    class FakeTracer:
+        def start_as_current_span(self, name, attributes=None):
+            return FakeSpan(name, attributes)
+
+    class FakeTrace:
+        def get_tracer(self, _name):
+            return FakeTracer()
+
+    anchor_dir = tmp_path / "anchors"
+    (anchor_dir / "ref").mkdir(parents=True)
+    (anchor_dir / "anchors.json").write_text(
+        json.dumps(
+            {
+                "anchors": {
+                    "ref": {
+                        "ref_text_path": "ref/ref.txt",
+                        "codec_path": "ref/codec.json",
+                        "metadata_path": "ref/metadata.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (anchor_dir / "ref/ref.txt").write_text("Reference.", encoding="utf-8")
+    (anchor_dir / "ref/codec.json").write_text(json.dumps([[1, 2], [3, 4]]), encoding="utf-8")
+    (anchor_dir / "ref/metadata.json").write_text(json.dumps({"source_kind": "jsonl"}), encoding="utf-8")
+
+    monkeypatch.delenv("OTEL_TRACES_EXPORTER", raising=False)
+    monkeypatch.setattr(_CONTINUITY, "_OTEL_CONFIGURED", False)
+    monkeypatch.setattr(_CONTINUITY, "_otel_trace", FakeTrace())
+    monkeypatch.setenv("VLLM_OMNI_QWEN3_TTS_CONTINUITY_ANCHORS_DIR", str(anchor_dir))
+    reset_continuity_anchors_for_test()
+
+    assert get_continuity_anchor("ref").ref_text == "Reference."
+
+    assert spans[-1].name == "qwen3_tts.continuity.anchor.lookup"
+    assert spans[-1].attributes["qwen3_tts.continuity.anchor.name"] == "ref"
+    assert spans[-1].attributes["qwen3_tts.continuity.anchor.loaded"] is True
+    assert spans[-1].attributes["qwen3_tts.continuity.anchor.source_kind"] == "jsonl"
+    assert spans[-1].attributes["qwen3_tts.continuity.codec.frames"] == 2
+    assert "qwen3_tts.continuity.anchor.lookup.duration_us" in spans[-1].attributes
+
+    reset_continuity_anchors_for_test()
+
+
 def test_load_continuity_anchors_rejects_malformed_codecs(tmp_path):
     anchor_dir = tmp_path / "anchors"
     (anchor_dir / "bad").mkdir(parents=True)
@@ -526,6 +593,8 @@ def test_telemetry_source_records_partial_progress_and_keeps_cache_spans_light()
     assert 'attrs = {"vllm_omni.audio.bytes": len(audio_bytes)}' in serving
     assert '"vllm_omni.continuity.mode": continuity_mode' in serving
     assert '"vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None' in serving
+    assert '"vllm_omni.continuity.anchor_name.present": request.continuity_anchor_name is not None' in serving
+    assert 'telemetry_attrs["vllm_omni.continuity.anchor_name"] = request.continuity_anchor_name' in serving
 
     assert "def _read_proc_kib_field" in continuity
     assert "process.memory.max_rss_bytes" not in continuity

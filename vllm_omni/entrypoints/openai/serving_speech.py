@@ -1551,17 +1551,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         chunk_count = 0
         bytes_emitted = 0
         continuity_mode = request.continuity_mode or "off"
+        telemetry_attrs = {
+            "vllm_omni.request.id": request_id,
+            "vllm_omni.audio.response_format": response_format,
+            "vllm_omni.audio.streaming": True,
+            "vllm_omni.continuity.mode": continuity_mode,
+            "vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None,
+            "vllm_omni.continuity.anchor_name.present": request.continuity_anchor_name is not None,
+        }
+        if request.continuity_anchor_name is not None:
+            telemetry_attrs["vllm_omni.continuity.anchor_name"] = request.continuity_anchor_name
 
         try:
             with telemetry_span(
                 "vllm_omni.audio.speech.stream",
-                {
-                    "vllm_omni.request.id": request_id,
-                    "vllm_omni.audio.response_format": response_format,
-                    "vllm_omni.audio.streaming": True,
-                    "vllm_omni.continuity.mode": continuity_mode,
-                    "vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None,
-                },
+                telemetry_attrs,
                 capture_memory=True,
             ) as span:
                 try:
@@ -2304,15 +2308,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_bytes: bytes | str = b""
         sample_rate: int | None = None
         continuity_mode = request.continuity_mode or "off"
+        telemetry_attrs = {
+            "vllm_omni.request.id": request_id,
+            "vllm_omni.audio.response_format": request.response_format or "wav",
+            "vllm_omni.audio.streaming": False,
+            "vllm_omni.continuity.mode": continuity_mode,
+            "vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None,
+            "vllm_omni.continuity.anchor_name.present": request.continuity_anchor_name is not None,
+        }
+        if request.continuity_anchor_name is not None:
+            telemetry_attrs["vllm_omni.continuity.anchor_name"] = request.continuity_anchor_name
         with telemetry_span(
             "vllm_omni.audio.speech.generate",
-            {
-                "vllm_omni.request.id": request_id,
-                "vllm_omni.audio.response_format": request.response_format or "wav",
-                "vllm_omni.audio.streaming": False,
-                "vllm_omni.continuity.mode": continuity_mode,
-                "vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None,
-            },
+            telemetry_attrs,
             capture_memory=True,
         ) as span:
             try:
