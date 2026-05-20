@@ -88,13 +88,9 @@ class OpenAICreateSpeechRequest(BaseModel):
             "'talker_icl', 'code2wav_context', and 'talker_icl+code2wav_context'."
         ),
     )
-    continuity_ref_text: str | None = Field(
+    continuity_anchor_name: str | None = Field(
         default=None,
-        description="Qwen3-TTS static talker ICL reference transcript.",
-    )
-    continuity_ref_code: list[list[int]] | None = Field(
-        default=None,
-        description="Qwen3-TTS static talker ICL reference codec frames shaped [frames, quantizers].",
+        description="Qwen3-TTS startup-loaded continuity anchor id for talker ICL.",
     )
     continuity_cache_key: str | None = Field(
         default=None,
@@ -129,24 +125,17 @@ class OpenAICreateSpeechRequest(BaseModel):
             raise ValueError(f"Unsupported continuity_mode value: {v!r}; expected one of: {', '.join(allowed)}")
         return v
 
-    @field_validator("continuity_ref_code", mode="before")
+    @field_validator("continuity_anchor_name")
     @classmethod
-    def validate_continuity_code(cls, v: Any | None) -> Any | None:
+    def validate_continuity_anchor_name(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        if not isinstance(v, list) or not v:
-            raise ValueError("continuity codec frames must be non-empty when provided")
-        if not all(isinstance(row, list) for row in v):
-            raise ValueError("continuity codec frames must be shaped [frames, quantizers]")
-        row_width = len(v[0])
-        if row_width == 0:
-            raise ValueError("continuity codec frames must have at least one quantizer")
-        for row in v:
-            if len(row) != row_width:
-                raise ValueError("continuity codec frames must be rectangular")
-            if any(not isinstance(code, int) or isinstance(code, bool) for code in row):
-                raise ValueError("continuity codec values must be integers")
-        return v
+        name = v.strip()
+        if not name:
+            raise ValueError("'continuity_anchor_name' must be non-empty when provided")
+        if "/" in name or "\\" in name:
+            raise ValueError("'continuity_anchor_name' must be a simple anchor id")
+        return name
 
     @field_validator("continuity_cache_key")
     @classmethod
@@ -168,11 +157,8 @@ class OpenAICreateSpeechRequest(BaseModel):
     @model_validator(mode="after")
     def validate_continuity_constraints(self) -> "OpenAICreateSpeechRequest":
         modes = set(self.continuity_mode.split("+")) if self.continuity_mode else set()
-        if "talker_icl" in modes:
-            if not self.continuity_ref_text or not self.continuity_ref_text.strip():
-                raise ValueError("'continuity_ref_text' is required when continuity_mode includes 'talker_icl'")
-            if self.continuity_ref_code is None:
-                raise ValueError("'continuity_ref_code' is required when continuity_mode includes 'talker_icl'")
+        if "talker_icl" in modes and self.continuity_anchor_name is None:
+            raise ValueError("'continuity_anchor_name' is required when continuity_mode includes 'talker_icl'")
         if "code2wav_context" in modes and self.continuity_cache_key is None:
             raise ValueError("'continuity_cache_key' is required when continuity_mode includes 'code2wav_context'")
         return self

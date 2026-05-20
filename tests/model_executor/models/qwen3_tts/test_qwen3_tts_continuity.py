@@ -1,5 +1,6 @@
 import builtins
 import importlib.util
+import json
 import sys
 import types
 from collections import defaultdict
@@ -25,6 +26,7 @@ def _load_continuity_module():
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -38,7 +40,10 @@ codec_frame_count = _CONTINUITY.codec_frame_count
 collect_memory_attributes = _CONTINUITY.collect_memory_attributes
 continuity_max_sessions_from_env = _CONTINUITY.continuity_max_sessions_from_env
 continuity_mode_enabled = _CONTINUITY.continuity_mode_enabled
+get_continuity_anchor = _CONTINUITY.get_continuity_anchor
+load_continuity_anchors_from_dir = _CONTINUITY.load_continuity_anchors_from_dir
 normalize_codec_frames = _CONTINUITY.normalize_codec_frames
+reset_continuity_anchors_for_test = _CONTINUITY.reset_continuity_anchors_for_test
 set_span_attributes = _CONTINUITY.set_span_attributes
 telemetry_span = _CONTINUITY.telemetry_span
 
@@ -196,6 +201,125 @@ def test_continuity_mode_checks_exact_canonical_values():
 
     with pytest.raises(ValueError, match="Unsupported"):
         continuity_mode_enabled("unknown", CONTINUITY_TALKER_ICL)
+
+
+def test_load_continuity_anchors_from_manifest(tmp_path):
+    anchor_dir = tmp_path / "anchors"
+    anchor_dir.mkdir()
+    (anchor_dir / "anchors.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "anchors": {
+                    "maya_s2_0028_jsonl": {
+                        "ref_text_path": "maya_s2_0028_jsonl/ref.txt",
+                        "codec_path": "maya_s2_0028_jsonl/codec.json",
+                        "metadata_path": "maya_s2_0028_jsonl/metadata.json",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (anchor_dir / "maya_s2_0028_jsonl").mkdir()
+    (anchor_dir / "maya_s2_0028_jsonl/ref.txt").write_text("Stable reference.", encoding="utf-8")
+    (anchor_dir / "maya_s2_0028_jsonl/codec.json").write_text(
+        json.dumps([[1, 2], [3, 4]]),
+        encoding="utf-8",
+    )
+    (anchor_dir / "maya_s2_0028_jsonl/metadata.json").write_text(
+        json.dumps({"source_kind": "jsonl"}),
+        encoding="utf-8",
+    )
+
+    anchors = load_continuity_anchors_from_dir(anchor_dir)
+
+    anchor = anchors["maya_s2_0028_jsonl"]
+    assert anchor.ref_text == "Stable reference."
+    assert anchor.ref_code.tolist() == [[1, 2], [3, 4]]
+    assert anchor.source_kind == "jsonl"
+    assert anchor.frame_count == 2
+    assert anchor.quantizer_count == 2
+
+
+def test_load_continuity_anchors_rejects_duplicate_normalized_names(tmp_path):
+    anchor_dir = tmp_path / "anchors"
+    anchor_dir.mkdir()
+    (anchor_dir / "ref").mkdir()
+    (anchor_dir / "anchors.json").write_text(
+        json.dumps(
+            {
+                "anchors": {
+                    "ref": {
+                        "ref_text_path": "ref/ref.txt",
+                        "codec_path": "ref/codec.json",
+                    },
+                    " ref ": {
+                        "ref_text_path": "ref/ref.txt",
+                        "codec_path": "ref/codec.json",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (anchor_dir / "ref/ref.txt").write_text("Reference.", encoding="utf-8")
+    (anchor_dir / "ref/codec.json").write_text(json.dumps([[1, 2]]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Duplicate continuity anchor name"):
+        load_continuity_anchors_from_dir(anchor_dir)
+
+
+def test_get_continuity_anchor_uses_env_registry_and_rejects_unknown(tmp_path, monkeypatch):
+    anchor_dir = tmp_path / "anchors"
+    (anchor_dir / "ref").mkdir(parents=True)
+    (anchor_dir / "anchors.json").write_text(
+        json.dumps(
+            {
+                "anchors": {
+                    "ref": {
+                        "ref_text_path": "ref/ref.txt",
+                        "codec_path": "ref/codec.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (anchor_dir / "ref/ref.txt").write_text("Reference.", encoding="utf-8")
+    (anchor_dir / "ref/codec.json").write_text(json.dumps([[1, 2]]), encoding="utf-8")
+
+    reset_continuity_anchors_for_test()
+    monkeypatch.setenv("VLLM_OMNI_QWEN3_TTS_CONTINUITY_ANCHORS_DIR", str(anchor_dir))
+
+    assert get_continuity_anchor("ref").ref_text == "Reference."
+    with pytest.raises(ValueError, match="Unknown Qwen3-TTS continuity anchor"):
+        get_continuity_anchor("missing")
+
+    reset_continuity_anchors_for_test()
+
+
+def test_load_continuity_anchors_rejects_malformed_codecs(tmp_path):
+    anchor_dir = tmp_path / "anchors"
+    (anchor_dir / "bad").mkdir(parents=True)
+    (anchor_dir / "anchors.json").write_text(
+        json.dumps(
+            {
+                "anchors": {
+                    "bad": {
+                        "ref_text_path": "bad/ref.txt",
+                        "codec_path": "bad/codec.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (anchor_dir / "bad/ref.txt").write_text("Reference.", encoding="utf-8")
+    (anchor_dir / "bad/codec.json").write_text(json.dumps([[1, 2], [3]]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Continuity anchor codec frames are invalid"):
+        load_continuity_anchors_from_dir(anchor_dir)
 
 
 def test_codec_frame_lru_cache_returns_prior_frames_and_evicts_oldest_key():
@@ -402,7 +526,6 @@ def test_telemetry_source_records_partial_progress_and_keeps_cache_spans_light()
     assert 'attrs = {"vllm_omni.audio.bytes": len(audio_bytes)}' in serving
     assert '"vllm_omni.continuity.mode": continuity_mode' in serving
     assert '"vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None' in serving
-    assert '"vllm_omni.continuity.ref_code.present": request.continuity_ref_code is not None' in serving
 
     assert "def _read_proc_kib_field" in continuity
     assert "process.memory.max_rss_bytes" not in continuity
@@ -450,12 +573,12 @@ def test_openai_speech_request_validates_continuity_cache_key_and_static_anchor(
     request = protocol.OpenAICreateSpeechRequest(
         input="Hello",
         continuity_mode="talker_icl+code2wav_context",
-        continuity_ref_text="Reference.",
-        continuity_ref_code=[[1, 2], [3, 4]],
+        continuity_anchor_name=" maya_s2_0028_jsonl ",
         continuity_cache_key=" session-a ",
     )
 
     assert request.continuity_mode == "talker_icl+code2wav_context"
+    assert request.continuity_anchor_name == "maya_s2_0028_jsonl"
     assert request.continuity_cache_key == "session-a"
 
     off_request = protocol.OpenAICreateSpeechRequest(input="Hello", continuity_mode="off")
@@ -467,11 +590,10 @@ def test_openai_speech_request_validates_continuity_cache_key_and_static_anchor(
     with pytest.raises(ValidationError, match="continuity_cache_key"):
         protocol.OpenAICreateSpeechRequest(input="Hello", continuity_mode="code2wav_context")
 
-    with pytest.raises(ValidationError, match="continuity_ref_code"):
+    with pytest.raises(ValidationError, match="continuity_anchor_name"):
         protocol.OpenAICreateSpeechRequest(
             input="Hello",
             continuity_mode="talker_icl",
-            continuity_ref_text="Reference.",
         )
 
 
@@ -481,16 +603,18 @@ def test_openai_speech_request_forwards_continuity_fields_to_qwen3_tts_metadata(
 
     for field in (
         "continuity_mode",
-        "continuity_ref_text",
-        "continuity_ref_code",
+        "continuity_anchor_name",
         "continuity_cache_key",
     ):
         assert field in protocol
         assert f'params["{field}"] = [request.{field}]' in serving
+    assert "continuity_ref_text" not in protocol
+    assert "continuity_ref_code" not in protocol
+    assert 'params["continuity_ref_text"]' not in serving
+    assert 'params["continuity_ref_code"]' not in serving
 
     assert "Unsupported continuity_mode value:" in protocol
-    assert "'continuity_ref_text' is required when continuity_mode includes 'talker_icl'" in protocol
-    assert "'continuity_ref_code' is required when continuity_mode includes 'talker_icl'" in protocol
+    assert "'continuity_anchor_name' is required when continuity_mode includes 'talker_icl'" in protocol
     assert "'continuity_cache_key' is required when continuity_mode includes 'code2wav_context'" in protocol
 
 
@@ -499,13 +623,11 @@ def test_customvoice_talker_icl_source_keeps_reference_on_talker_path_only():
 
     assert "CONTINUITY_TALKER_ICL" in source
     assert 'info.get("continuity_mode"), CONTINUITY_TALKER_ICL' in source
-    assert "continuity_ref_text" in source
-    assert "continuity_ref_code" in source
-    assert "talker_icl continuity requires continuity_ref_text" in source
-    assert "talker_icl continuity requires continuity_ref_code" in source
+    assert "get_continuity_anchor" in source
+    assert "continuity_anchor_name" in source
     assert "Qwen3-TTS talker continuity ICL active" in source
     assert "ref_code=continuity_ref_code" in source
-    assert "codec_lens = 1 + int(continuity_ref_code_len)" in source
+    assert "codec_lens = 1 + continuity_anchor.frame_count" in source
     assert "prompt_len += text_lens + codec_lens if non_streaming_mode else codec_lens" in source
 
 

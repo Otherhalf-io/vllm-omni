@@ -1,8 +1,9 @@
 """Small Qwen3-TTS continuity helpers.
 
-The helpers in this module are intentionally policy-free.  They only parse
-request metadata and normalize codec frames so callers can decide whether to
-use static talker ICL or Code2Wav left context.
+This module stays policy-free: it validates canonical request metadata, loads
+named talker anchors from local files, manages the bounded Code2Wav codec cache,
+and exposes optional telemetry helpers. Callers decide when to use each
+primitive.
 """
 
 from __future__ import annotations
@@ -10,10 +11,13 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import json
 import os
 import time
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from threading import RLock
 from typing import Any
 
@@ -37,9 +41,34 @@ except ImportError:  # pragma: no cover - keep vLLM-Omni usable without OTEL.
     _otel_trace = None
 
 _TRACER_NAME = "vllm_omni.qwen3_tts"
+_ANCHORS_DIR_ENV = "VLLM_OMNI_QWEN3_TTS_CONTINUITY_ANCHORS_DIR"
 _MEM_TOTAL_BYTES_READ = False
 _MEM_TOTAL_BYTES: int | None = None
 _OTEL_CONFIGURED = False
+_ANCHORS_LOADED = False
+_ANCHORS: dict[str, ContinuityAnchor] = {}
+_ANCHORS_LOCK = RLock()
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuityAnchor:
+    """A startup-loaded talker ICL anchor."""
+
+    name: str
+    ref_text: str
+    ref_code: torch.Tensor
+    source_kind: str | None = None
+
+    @property
+    def frame_count(self) -> int:
+        return int(self.ref_code.shape[0])
+
+    @property
+    def quantizer_count(self) -> int:
+        return int(self.ref_code.shape[1])
+
+    def code_to(self, *, device: torch.device | None = None) -> torch.Tensor:
+        return self.ref_code.to(device=device, dtype=torch.long).contiguous()
 
 
 def continuity_mode_enabled(value: object, mode: str) -> bool:
@@ -130,6 +159,139 @@ def normalize_cache_key(value: object) -> str | None:
     if not key:
         raise ValueError("continuity_cache_key must be non-empty when provided")
     return key
+
+
+def normalize_anchor_name(value: object) -> str | None:
+    """Normalize an optional continuity anchor name."""
+    value = unwrap_singleton(value)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("continuity_anchor_name must be a string")
+    name = value.strip()
+    if not name:
+        raise ValueError("continuity_anchor_name must be non-empty when provided")
+    if "/" in name or "\\" in name or Path(name).name != name:
+        raise ValueError("continuity_anchor_name must be a simple anchor id")
+    return name
+
+
+def _read_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Failed to read continuity anchor JSON: {path}") from exc
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"Failed to read continuity anchor text: {path}") from exc
+    if not text:
+        raise ValueError(f"Continuity anchor text is empty: {path}")
+    return text
+
+
+def _relative_anchor_path(anchor_dir: Path, raw_path: object, *, field: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError(f"Continuity anchor manifest field {field!r} must be a non-empty relative path")
+    candidate = Path(raw_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError(f"Continuity anchor manifest field {field!r} must stay inside the anchor directory")
+    return anchor_dir / candidate
+
+
+def _load_anchor_metadata(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    if not path.exists():
+        return {}
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Continuity anchor metadata must be a JSON object: {path}")
+    return payload
+
+
+def load_continuity_anchors_from_dir(anchor_dir: str | os.PathLike[str]) -> dict[str, ContinuityAnchor]:
+    """Load all Qwen3-TTS talker anchors from a local synced anchor directory."""
+    root = Path(anchor_dir)
+    manifest_path = root / "anchors.json"
+    if not manifest_path.is_file():
+        raise ValueError(f"Continuity anchor manifest not found: {manifest_path}")
+
+    manifest = _read_json_file(manifest_path)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("anchors"), dict):
+        raise ValueError("Continuity anchor manifest must be an object with an 'anchors' object")
+
+    anchors: dict[str, ContinuityAnchor] = {}
+    for raw_name, raw_entry in manifest["anchors"].items():
+        name = normalize_anchor_name(raw_name)
+        if name is None:
+            raise ValueError("Continuity anchor manifest contains an empty anchor name")
+        if name in anchors:
+            raise ValueError(f"Duplicate continuity anchor name after normalization: {name}")
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"Continuity anchor entry must be an object: {name}")
+
+        text_path = _relative_anchor_path(root, raw_entry.get("ref_text_path"), field=f"{name}.ref_text_path")
+        codec_path = _relative_anchor_path(root, raw_entry.get("codec_path"), field=f"{name}.codec_path")
+        metadata_path_raw = raw_entry.get("metadata_path")
+        metadata_path = (
+            _relative_anchor_path(root, metadata_path_raw, field=f"{name}.metadata_path")
+            if metadata_path_raw is not None
+            else None
+        )
+        ref_text = _read_text_file(text_path)
+        ref_code = normalize_codec_frames(_read_json_file(codec_path))
+        if ref_code is None:
+            raise ValueError(f"Continuity anchor codec frames are invalid: {codec_path}")
+        metadata = _load_anchor_metadata(metadata_path)
+        anchors[name] = ContinuityAnchor(
+            name=name,
+            ref_text=ref_text,
+            ref_code=ref_code.cpu().contiguous(),
+            source_kind=metadata.get("source_kind") if isinstance(metadata.get("source_kind"), str) else None,
+        )
+
+    return anchors
+
+
+def load_continuity_anchors_from_env() -> dict[str, ContinuityAnchor]:
+    """Load configured anchors once per process."""
+    global _ANCHORS, _ANCHORS_LOADED
+    with _ANCHORS_LOCK:
+        if _ANCHORS_LOADED:
+            return _ANCHORS
+        anchor_dir = os.environ.get(_ANCHORS_DIR_ENV)
+        if not anchor_dir:
+            _ANCHORS = {}
+            _ANCHORS_LOADED = True
+            return _ANCHORS
+        _ANCHORS = load_continuity_anchors_from_dir(anchor_dir)
+        _ANCHORS_LOADED = True
+        return _ANCHORS
+
+
+def reset_continuity_anchors_for_test() -> None:
+    """Clear the process-local anchor registry for focused tests."""
+    global _ANCHORS, _ANCHORS_LOADED
+    with _ANCHORS_LOCK:
+        _ANCHORS = {}
+        _ANCHORS_LOADED = False
+
+
+def get_continuity_anchor(name: object) -> ContinuityAnchor:
+    """Return a configured talker ICL anchor by request-provided name."""
+    anchor_name = normalize_anchor_name(name)
+    if anchor_name is None:
+        raise ValueError("talker_icl continuity requires continuity_anchor_name")
+    anchors = load_continuity_anchors_from_env()
+    anchor = anchors.get(anchor_name)
+    if anchor is None:
+        available = ", ".join(sorted(anchors)) or "<none loaded>"
+        raise ValueError(f"Unknown Qwen3-TTS continuity anchor {anchor_name!r}; available anchors: {available}")
+    return anchor
 
 
 def continuity_max_sessions_from_env() -> int:

@@ -54,6 +54,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.model_executor.models.qwen3_tts.continuity import (
+    load_continuity_anchors_from_env,
     set_span_attributes,
     telemetry_span,
 )
@@ -340,6 +341,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
+        if self._tts_model_type == "qwen3_tts":
+            anchors = load_continuity_anchors_from_env()
+            if anchors:
+                logger.info("Loaded %d Qwen3-TTS continuity anchor(s): %s", len(anchors), sorted(anchors))
 
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
@@ -1556,7 +1561,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "vllm_omni.audio.streaming": True,
                     "vllm_omni.continuity.mode": continuity_mode,
                     "vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None,
-                    "vllm_omni.continuity.ref_code.present": request.continuity_ref_code is not None,
                 },
                 capture_memory=True,
             ) as span:
@@ -1783,10 +1787,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if request.continuity_mode is not None:
             params["continuity_mode"] = [request.continuity_mode]
-        if request.continuity_ref_text is not None:
-            params["continuity_ref_text"] = [request.continuity_ref_text]
-        if request.continuity_ref_code is not None:
-            params["continuity_ref_code"] = [request.continuity_ref_code]
+        if request.continuity_anchor_name is not None:
+            params["continuity_anchor_name"] = [request.continuity_anchor_name]
         if request.continuity_cache_key is not None:
             params["continuity_cache_key"] = [request.continuity_cache_key]
 
@@ -2310,7 +2312,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "vllm_omni.audio.streaming": False,
                 "vllm_omni.continuity.mode": continuity_mode,
                 "vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None,
-                "vllm_omni.continuity.ref_code.present": request.continuity_ref_code is not None,
             },
             capture_memory=True,
         ) as span:
