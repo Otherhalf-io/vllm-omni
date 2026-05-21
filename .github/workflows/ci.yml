@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qwen3-tts-continuity:
+    name: Qwen3 TTS Continuity Patch
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Compile focused patch files
+        run: |
+          set -euo pipefail
+          uv run --python 3.12 python -m py_compile \
+            vllm_omni/entrypoints/openai/protocol/audio.py \
+            vllm_omni/entrypoints/openai/serving_speech.py \
+            vllm_omni/model_executor/models/qwen3_tts/continuity.py \
+            vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py \
+            vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+
+      - name: Lint focused patch files
+        run: |
+          set -euo pipefail
+          paths=(
+            vllm_omni/entrypoints/openai/protocol/audio.py
+            vllm_omni/entrypoints/openai/serving_speech.py
+            vllm_omni/model_executor/models/qwen3_tts/continuity.py
+            vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py
+            vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
+            tests/model_executor/models/qwen3_tts/test_qwen3_tts_continuity.py
+          )
+
+          uv run --with ruff ruff check "${paths[@]}"
+          uv run --with ruff ruff format --check "${paths[@]}"
+
+      - name: Run focused tests
+        run: |
+          set -euo pipefail
+          uv run \
+            --python 3.12 \
+            --with pytest \
+            --with pydantic \
+            --with numpy \
+            --with torch \
+            pytest -q --confcutdir=tests/model_executor/models/qwen3_tts --maxfail=1 \
+              tests/model_executor/models/qwen3_tts/test_qwen3_tts_continuity.py

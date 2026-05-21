@@ -1741,6 +1741,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if request.initial_codec_chunk_frames is not None:
             params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
 
+        if request.continuity_mode is not None:
+            params["continuity_mode"] = [request.continuity_mode]
+        if request.continuity_ref_text is not None:
+            params["continuity_ref_text"] = [request.continuity_ref_text]
+        if request.continuity_ref_code is not None:
+            params["continuity_ref_code"] = [request.continuity_ref_code]
+        if request.continuity_cache_key is not None:
+            params["continuity_cache_key"] = [request.continuity_cache_key]
+
         # VoiceDesign requires non_streaming_mode (match offline script behaviour).
         # CustomVoice and Base rely on the model default (True and False respectively).
         if params["task_type"][0] == "VoiceDesign":
