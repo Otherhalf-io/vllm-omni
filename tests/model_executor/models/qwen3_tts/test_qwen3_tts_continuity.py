@@ -1,3 +1,4 @@
+import builtins
 import importlib.util
 import sys
 import types
@@ -32,10 +33,14 @@ _CONTINUITY = _load_continuity_module()
 CONTINUITY_CODE2WAV_CONTEXT = _CONTINUITY.CONTINUITY_CODE2WAV_CONTEXT
 CONTINUITY_TALKER_ICL = _CONTINUITY.CONTINUITY_TALKER_ICL
 CodecFrameLRUCache = _CONTINUITY.CodecFrameLRUCache
+cache_key_hash = _CONTINUITY.cache_key_hash
 codec_frame_count = _CONTINUITY.codec_frame_count
+collect_memory_attributes = _CONTINUITY.collect_memory_attributes
 continuity_max_sessions_from_env = _CONTINUITY.continuity_max_sessions_from_env
 continuity_mode_enabled = _CONTINUITY.continuity_mode_enabled
 normalize_codec_frames = _CONTINUITY.normalize_codec_frames
+set_span_attributes = _CONTINUITY.set_span_attributes
+telemetry_span = _CONTINUITY.telemetry_span
 
 
 def _load_module_from_repo(name: str, path: str):
@@ -205,6 +210,218 @@ def test_codec_frame_lru_cache_returns_prior_frames_and_evicts_oldest_key():
     assert cache.keys() == ["session-a", "session-c"]
 
 
+def test_telemetry_helpers_are_optional_and_low_cardinality():
+    assert cache_key_hash("maya_warm:room-42") == cache_key_hash("maya_warm:room-42")
+    assert cache_key_hash("maya_warm:room-42") != "maya_warm:room-42"
+
+    attrs = collect_memory_attributes("probe")
+    assert isinstance(attrs, dict)
+    assert all(key.startswith("probe.") for key in attrs)
+    assert all(value >= 0 for value in attrs.values())
+
+    with telemetry_span("qwen3_tts.test", {"test.attribute": 1}, capture_memory=True) as span:
+        set_span_attributes(span, {"test.attribute.after": 2})
+
+
+def test_cache_telemetry_records_read_write_duration_and_cache_attributes(monkeypatch):
+    spans = []
+
+    class FakeSpan:
+        def __init__(self, name, attributes):
+            self.name = name
+            self.attributes = dict(attributes or {})
+
+        def __enter__(self):
+            spans.append(self)
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            return False
+
+        def is_recording(self):
+            return True
+
+        def set_attribute(self, key, value):
+            self.attributes[key] = value
+
+    class FakeTracer:
+        def start_as_current_span(self, name, attributes=None):
+            return FakeSpan(name, attributes)
+
+    class FakeTrace:
+        def get_tracer(self, _name):
+            return FakeTracer()
+
+    monkeypatch.delenv("OTEL_TRACES_EXPORTER", raising=False)
+    monkeypatch.setattr(_CONTINUITY, "_OTEL_CONFIGURED", False)
+    monkeypatch.setattr(_CONTINUITY, "_otel_trace", FakeTrace())
+
+    cache = CodecFrameLRUCache(max_sessions=2)
+    assert cache.put("session-a", [[1, 2], [3, 4]])
+    assert cache.get("session-a").tolist() == [[1, 2], [3, 4]]
+
+    write_span = next(span for span in spans if span.name == "qwen3_tts.continuity.cache.write")
+    read_span = next(span for span in spans if span.name == "qwen3_tts.continuity.cache.read")
+    for span in (write_span, read_span):
+        assert isinstance(span.attributes["qwen3_tts.continuity.cache.duration_us"], int)
+        assert span.attributes["qwen3_tts.continuity.cache.duration_us"] >= 0
+        assert span.attributes["qwen3_tts.continuity.cache.key_hash"] == cache_key_hash("session-a")
+        assert "session-a" not in span.attributes.values()
+
+    assert write_span.attributes["qwen3_tts.continuity.cache.evicted"] == 0
+    assert write_span.attributes["qwen3_tts.continuity.codec.frames"] == 2
+    assert read_span.attributes["qwen3_tts.continuity.cache.hit"] is True
+    assert read_span.attributes["qwen3_tts.continuity.cache.size"] == 1
+
+
+def test_console_telemetry_does_not_require_otlp_exporter(monkeypatch):
+    providers = []
+
+    class FakeResource:
+        @staticmethod
+        def create(attributes):
+            return attributes
+
+    class FakeTracerProvider:
+        def __init__(self, resource):
+            self.resource = resource
+            self.span_processors = []
+
+        def add_span_processor(self, span_processor):
+            self.span_processors.append(span_processor)
+
+    class FakeConsoleSpanExporter:
+        pass
+
+    class FakeSimpleSpanProcessor:
+        def __init__(self, exporter):
+            self.exporter = exporter
+
+    class FakeTrace:
+        def set_tracer_provider(self, provider):
+            providers.append(provider)
+
+    modules = {
+        "opentelemetry": types.ModuleType("opentelemetry"),
+        "opentelemetry.sdk": types.ModuleType("opentelemetry.sdk"),
+        "opentelemetry.sdk.resources": types.ModuleType("opentelemetry.sdk.resources"),
+        "opentelemetry.sdk.trace": types.ModuleType("opentelemetry.sdk.trace"),
+        "opentelemetry.sdk.trace.export": types.ModuleType("opentelemetry.sdk.trace.export"),
+    }
+    modules["opentelemetry.sdk.resources"].Resource = FakeResource
+    modules["opentelemetry.sdk.trace"].TracerProvider = FakeTracerProvider
+    modules["opentelemetry.sdk.trace.export"].ConsoleSpanExporter = FakeConsoleSpanExporter
+    modules["opentelemetry.sdk.trace.export"].SimpleSpanProcessor = FakeSimpleSpanProcessor
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    real_import = builtins.__import__
+
+    def import_without_otlp(name, *args, **kwargs):
+        if name.startswith("opentelemetry.exporter"):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_otlp)
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", "console")
+    monkeypatch.setattr(_CONTINUITY, "_OTEL_CONFIGURED", False)
+    monkeypatch.setattr(_CONTINUITY, "_otel_trace", FakeTrace())
+
+    _CONTINUITY.configure_telemetry_from_env()
+
+    assert _CONTINUITY._OTEL_CONFIGURED is True
+    assert len(providers) == 1
+    assert len(providers[0].span_processors) == 1
+
+
+def test_failed_telemetry_exporter_import_is_not_sticky(monkeypatch):
+    providers = []
+
+    class FakeResource:
+        @staticmethod
+        def create(attributes):
+            return attributes
+
+    class FakeTracerProvider:
+        def __init__(self, resource):
+            self.resource = resource
+            self.span_processors = []
+
+        def add_span_processor(self, span_processor):
+            self.span_processors.append(span_processor)
+
+    class FakeTrace:
+        def set_tracer_provider(self, provider):
+            providers.append(provider)
+
+    modules = {
+        "opentelemetry": types.ModuleType("opentelemetry"),
+        "opentelemetry.sdk": types.ModuleType("opentelemetry.sdk"),
+        "opentelemetry.sdk.resources": types.ModuleType("opentelemetry.sdk.resources"),
+        "opentelemetry.sdk.trace": types.ModuleType("opentelemetry.sdk.trace"),
+    }
+    modules["opentelemetry.sdk.resources"].Resource = FakeResource
+    modules["opentelemetry.sdk.trace"].TracerProvider = FakeTracerProvider
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    real_import = builtins.__import__
+
+    def import_without_otlp(name, *args, **kwargs):
+        if name.startswith("opentelemetry.exporter"):
+            raise ImportError(name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_otlp)
+    monkeypatch.setenv("OTEL_TRACES_EXPORTER", "otlp")
+    monkeypatch.setattr(_CONTINUITY, "_OTEL_CONFIGURED", False)
+    monkeypatch.setattr(_CONTINUITY, "_otel_trace", FakeTrace())
+
+    _CONTINUITY.configure_telemetry_from_env()
+
+    assert _CONTINUITY._OTEL_CONFIGURED is False
+    assert providers == []
+
+
+def test_telemetry_source_records_partial_progress_and_keeps_cache_spans_light():
+    serving = _read_repo_file("vllm_omni/entrypoints/openai/serving_speech.py")
+    continuity = _read_repo_file("vllm_omni/model_executor/models/qwen3_tts/continuity.py")
+
+    assert "configure_telemetry_from_env()" in continuity
+    assert "OTEL_TRACES_EXPORTER" in continuity
+    assert "LANGFUSE_BASE_URL" in continuity
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" in continuity
+    assert "BatchSpanProcessor(OTLPSpanExporter())" in continuity
+    assert '"service.name": os.environ.get("OTEL_SERVICE_NAME", "vllm-omni")' in continuity
+    assert "time.perf_counter_ns()" in continuity
+    assert 'duration_attribute="qwen3_tts.continuity.cache.duration_us"' in continuity
+
+    assert "finally:\n                    set_span_attributes(\n                        span," in serving
+    assert '"vllm_omni.audio.chunk_count": chunk_count' in serving
+    assert 'audio_bytes: bytes | str = b""' in serving
+    assert 'attrs = {"vllm_omni.audio.bytes": len(audio_bytes)}' in serving
+    assert '"vllm_omni.continuity.mode": continuity_mode' in serving
+    assert '"vllm_omni.continuity.cache_key.present": request.continuity_cache_key is not None' in serving
+    assert '"vllm_omni.continuity.ref_code.present": request.continuity_ref_code is not None' in serving
+
+    assert "def _read_proc_kib_field" in continuity
+    assert "process.memory.max_rss_bytes" not in continuity
+    assert "torch.accelerator.current_device_index()" in continuity
+    assert "except (AttributeError, RuntimeError):" in continuity
+    assert "capture_memory=False" in continuity
+
+
+def test_tokenizer_decoder_forward_documents_cache_position_for_clean_startup_logs():
+    tokenizer_v2 = _read_repo_file(
+        "vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py"
+    )
+
+    assert "@auto_docstring\n    def forward(\n        self,\n        input_ids=None," in tokenizer_v2
+    assert "cache_position=None,\n        **kwargs,\n    ) -> BaseModelOutputWithPast:" in tokenizer_v2
+    assert "cache_position (`torch.LongTensor`, *optional*):" in tokenizer_v2
+    assert "Absolute positions for the current tokens in the cache." in tokenizer_v2
+
+
 def test_continuity_max_sessions_env_is_strict(monkeypatch):
     env_name = "VLLM_OMNI_QWEN3_TTS_CONTINUITY_MAX_SESSIONS"
 
@@ -333,6 +550,17 @@ def test_code2wav_context_prepends_cached_frames_to_first_window(monkeypatch):
     assert payload.meta.left_context_size == 2
     assert len(payload.codes.audio) == 4 * 12
     assert payload.codes.audio[:2].tolist() == [9, 8]
+
+
+def test_code2wav_model_skips_terminal_token_without_malformed_warning():
+    source = _read_repo_file("vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py")
+
+    assert "if n == 1:" in source
+    assert "Code2Wav received one terminal token" in source
+    assert "logger.debug(" in source
+    assert "elif n > 0:" in source
+    assert "logger.warning(" in source
+    assert "not divisible by num_quantizers" in source
 
 
 def test_code2wav_context_uses_prior_cache_before_storing_finished_request(monkeypatch):

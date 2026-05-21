@@ -534,6 +534,24 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         cache_position=None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        """
+        Args:
+            input_ids: Unused for this decoder; callers must pass ``inputs_embeds``.
+            attention_mask (`torch.Tensor`, *optional*):
+                Attention mask passed through to the decoder layers.
+            position_ids (`torch.LongTensor`, *optional*):
+                Position ids for the current input sequence.
+            past_key_values (`Cache`, *optional*):
+                Cached key/value states used for incremental decoding.
+            inputs_embeds (`torch.Tensor`, *optional*):
+                Input embeddings for the decoder.
+            use_cache (`bool`, *optional*):
+                Whether to return updated key/value cache state.
+            cache_position (`torch.LongTensor`, *optional*):
+                Absolute positions for the current tokens in the cache.
+            kwargs (`dict`, *optional*):
+                Additional keyword arguments forwarded to decoder layers.
+        """
         if input_ids is not None:
             raise ValueError("input_ids is not expected")
         if (input_ids is None) ^ (inputs_embeds is not None):

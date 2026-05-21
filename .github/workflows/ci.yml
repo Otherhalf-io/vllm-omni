@@ -29,7 +29,9 @@ jobs:
             vllm_omni/entrypoints/openai/protocol/audio.py \
             vllm_omni/entrypoints/openai/serving_speech.py \
             vllm_omni/model_executor/models/qwen3_tts/continuity.py \
+            vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py \
             vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py \
+            vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py \
             vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
 
       - name: Lint focused patch files
@@ -39,7 +41,9 @@ jobs:
             vllm_omni/entrypoints/openai/protocol/audio.py
             vllm_omni/entrypoints/openai/serving_speech.py
             vllm_omni/model_executor/models/qwen3_tts/continuity.py
+            vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_code2wav.py
             vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py
+            vllm_omni/model_executor/models/qwen3_tts/tokenizer_12hz/modeling_qwen3_tts_tokenizer_v2.py
             vllm_omni/model_executor/stage_input_processors/qwen3_tts.py
             tests/model_executor/models/qwen3_tts/test_qwen3_tts_continuity.py
           )
