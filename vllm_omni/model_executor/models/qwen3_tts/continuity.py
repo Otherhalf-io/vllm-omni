@@ -286,12 +286,34 @@ def get_continuity_anchor(name: object) -> ContinuityAnchor:
     anchor_name = normalize_anchor_name(name)
     if anchor_name is None:
         raise ValueError("talker_icl continuity requires continuity_anchor_name")
-    anchors = load_continuity_anchors_from_env()
-    anchor = anchors.get(anchor_name)
-    if anchor is None:
-        available = ", ".join(sorted(anchors)) or "<none loaded>"
-        raise ValueError(f"Unknown Qwen3-TTS continuity anchor {anchor_name!r}; available anchors: {available}")
-    return anchor
+    with telemetry_span(
+        "qwen3_tts.continuity.anchor.lookup",
+        {"qwen3_tts.continuity.anchor.name": anchor_name},
+        duration_attribute="qwen3_tts.continuity.anchor.lookup.duration_us",
+    ) as span:
+        anchors = load_continuity_anchors_from_env()
+        anchor = anchors.get(anchor_name)
+        if anchor is None:
+            set_span_attributes(
+                span,
+                {
+                    "qwen3_tts.continuity.anchor.loaded": False,
+                    "qwen3_tts.continuity.anchor.registry.size": len(anchors),
+                },
+            )
+            available = ", ".join(sorted(anchors)) or "<none loaded>"
+            raise ValueError(f"Unknown Qwen3-TTS continuity anchor {anchor_name!r}; available anchors: {available}")
+        set_span_attributes(
+            span,
+            {
+                "qwen3_tts.continuity.anchor.loaded": True,
+                "qwen3_tts.continuity.anchor.source_kind": anchor.source_kind,
+                "qwen3_tts.continuity.anchor.registry.size": len(anchors),
+                "qwen3_tts.continuity.codec.frames": anchor.frame_count,
+                "qwen3_tts.continuity.codec.quantizers": anchor.quantizer_count,
+            },
+        )
+        return anchor
 
 
 def continuity_max_sessions_from_env() -> int:
