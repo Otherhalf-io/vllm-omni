@@ -30,9 +30,8 @@ from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_tts.continuity import (
     CONTINUITY_TALKER_ICL,
-    codec_frame_count,
     continuity_mode_enabled,
-    normalize_codec_frames,
+    get_continuity_anchor,
     unwrap_singleton,
 )
 from vllm_omni.utils.audio import mel_filter_bank
@@ -803,20 +802,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             use_talker_icl = task_type == "CustomVoice" and continuity_mode_enabled(
                 info.get("continuity_mode"), CONTINUITY_TALKER_ICL
             )
-            continuity_ref_text = unwrap_singleton(info.get("continuity_ref_text"))
-            continuity_ref_code_len = codec_frame_count(info.get("continuity_ref_code"))
             if use_talker_icl:
-                if not isinstance(continuity_ref_text, str) or not continuity_ref_text.strip():
-                    raise ValueError("talker_icl continuity requires continuity_ref_text")
-                if not continuity_ref_code_len:
-                    raise ValueError("talker_icl continuity requires continuity_ref_code")
+                continuity_anchor = get_continuity_anchor(info.get("continuity_anchor_name"))
                 ref_text_ids = tokenize_prompt(
-                    Qwen3TTSTalkerForConditionalGeneration._build_ref_text(continuity_ref_text)
+                    Qwen3TTSTalkerForConditionalGeneration._build_ref_text(continuity_anchor.ref_text)
                 )
                 ref_id_len = max(0, len(ref_text_ids) - 5)
                 text_id_len = max(0, int(assistant_len) - 8)
                 text_lens = ref_id_len + text_id_len + 1
-                codec_lens = 1 + int(continuity_ref_code_len)
+                codec_lens = 1 + continuity_anchor.frame_count
                 prompt_len += text_lens + codec_lens if non_streaming_mode else codec_lens
             elif non_streaming_mode:
                 # model: full text ids (input_ids[:, 3:-5]) + eos + codec_bos step
@@ -1589,16 +1583,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
 
             use_talker_icl = continuity_mode_enabled(info_dict.get("continuity_mode"), CONTINUITY_TALKER_ICL)
-            continuity_ref_code = normalize_codec_frames(info_dict.get("continuity_ref_code"), device=input_ids.device)
-            continuity_ref_text = unwrap_singleton(info_dict.get("continuity_ref_text"))
 
             if use_talker_icl:
-                if not isinstance(continuity_ref_text, str) or not continuity_ref_text.strip():
-                    raise ValueError("talker_icl continuity requires continuity_ref_text")
-                if continuity_ref_code is None:
-                    raise ValueError("talker_icl continuity requires continuity_ref_code")
+                continuity_anchor = get_continuity_anchor(info_dict.get("continuity_anchor_name"))
+                continuity_ref_code = continuity_anchor.code_to(device=input_ids.device)
                 ref_ids = tok(
-                    self._build_ref_text(continuity_ref_text),
+                    self._build_ref_text(continuity_anchor.ref_text),
                     return_tensors="pt",
                     padding=False,
                 )["input_ids"].to(device=input_ids.device)
@@ -1614,7 +1604,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 if not self._qwen3_tts_logged_talker_continuity:
                     self._qwen3_tts_logged_talker_continuity = True
                     logger.info(
-                        "Qwen3-TTS talker continuity ICL active: ref_frames=%d speaker=%s",
+                        "Qwen3-TTS talker continuity ICL active: anchor=%s ref_frames=%d speaker=%s",
+                        continuity_anchor.name,
                         int(continuity_ref_code.shape[0]),
                         speaker,
                     )
