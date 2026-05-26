@@ -397,6 +397,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
+        _remove_route_from_app(app, "/health", {"GET"})  # Remove upstream /health to expose omni health details
         app.include_router(router)
 
         # OMNI: Override upstream exception handlers with Omni-aware versions
@@ -1430,7 +1431,11 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
-        return JSONResponse(content={"status": "healthy"})
+        content: dict[str, object] = {"status": "healthy"}
+        speech_handler = getattr(raw_request.app.state, "openai_serving_speech", None)
+        if speech_handler is not None and hasattr(speech_handler, "get_speech_health_snapshot"):
+            content["tts"] = speech_handler.get_speech_health_snapshot()
+        return JSONResponse(content=content)
     except EngineDeadError:
         return JSONResponse(
             content={"status": "unhealthy"},

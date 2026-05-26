@@ -2,20 +2,16 @@
 
 This module stays policy-free: it validates canonical request metadata, loads
 named talker anchors from local files, manages the bounded Code2Wav codec cache,
-and exposes optional telemetry helpers. Callers decide when to use each
-primitive.
+and keeps continuity state in-process. Callers decide when to use each
+primitive; service telemetry is owned by the System1 sidecar.
 """
 
 from __future__ import annotations
 
-import base64
-import contextlib
 import hashlib
 import json
 import os
-import time
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
@@ -35,16 +31,7 @@ CONTINUITY_MODES = (
     CONTINUITY_BOTH,
 )
 
-try:  # pragma: no cover - exercised only when OpenTelemetry is installed.
-    from opentelemetry import trace as _otel_trace
-except ImportError:  # pragma: no cover - keep vLLM-Omni usable without OTEL.
-    _otel_trace = None
-
-_TRACER_NAME = "vllm_omni.qwen3_tts"
 _ANCHORS_DIR_ENV = "VLLM_OMNI_QWEN3_TTS_CONTINUITY_ANCHORS_DIR"
-_MEM_TOTAL_BYTES_READ = False
-_MEM_TOTAL_BYTES: int | None = None
-_OTEL_CONFIGURED = False
 _ANCHORS_LOADED = False
 _ANCHORS: dict[str, ContinuityAnchor] = {}
 _ANCHORS_LOCK = RLock()
@@ -286,34 +273,12 @@ def get_continuity_anchor(name: object) -> ContinuityAnchor:
     anchor_name = normalize_anchor_name(name)
     if anchor_name is None:
         raise ValueError("talker_icl continuity requires continuity_anchor_name")
-    with telemetry_span(
-        "qwen3_tts.continuity.anchor.lookup",
-        {"qwen3_tts.continuity.anchor.name": anchor_name},
-        duration_attribute="qwen3_tts.continuity.anchor.lookup.duration_us",
-    ) as span:
-        anchors = load_continuity_anchors_from_env()
-        anchor = anchors.get(anchor_name)
-        if anchor is None:
-            set_span_attributes(
-                span,
-                {
-                    "qwen3_tts.continuity.anchor.loaded": False,
-                    "qwen3_tts.continuity.anchor.registry.size": len(anchors),
-                },
-            )
-            available = ", ".join(sorted(anchors)) or "<none loaded>"
-            raise ValueError(f"Unknown Qwen3-TTS continuity anchor {anchor_name!r}; available anchors: {available}")
-        set_span_attributes(
-            span,
-            {
-                "qwen3_tts.continuity.anchor.loaded": True,
-                "qwen3_tts.continuity.anchor.source_kind": anchor.source_kind,
-                "qwen3_tts.continuity.anchor.registry.size": len(anchors),
-                "qwen3_tts.continuity.codec.frames": anchor.frame_count,
-                "qwen3_tts.continuity.codec.quantizers": anchor.quantizer_count,
-            },
-        )
-        return anchor
+    anchors = load_continuity_anchors_from_env()
+    anchor = anchors.get(anchor_name)
+    if anchor is None:
+        available = ", ".join(sorted(anchors)) or "<none loaded>"
+        raise ValueError(f"Unknown Qwen3-TTS continuity anchor {anchor_name!r}; available anchors: {available}")
+    return anchor
 
 
 def continuity_max_sessions_from_env() -> int:
@@ -332,184 +297,8 @@ def continuity_max_sessions_from_env() -> int:
 
 
 def cache_key_hash(key: str) -> str:
-    """Return a stable low-cardinality identifier for cache telemetry."""
+    """Return a stable low-cardinality identifier for diagnostics."""
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
-
-
-def _read_proc_kib_field(path: str, field: str) -> int | None:
-    try:
-        with open(path) as proc_file:
-            for line in proc_file:
-                if line.startswith(f"{field}:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1]) * 1024
-    except (OSError, ValueError):
-        return None
-    return None
-
-
-def _read_proc_status_bytes(field: str) -> int | None:
-    return _read_proc_kib_field("/proc/self/status", field)
-
-
-def _read_meminfo_bytes(field: str) -> int | None:
-    return _read_proc_kib_field("/proc/meminfo", field)
-
-
-def _read_mem_total_bytes() -> int | None:
-    global _MEM_TOTAL_BYTES_READ, _MEM_TOTAL_BYTES
-    if not _MEM_TOTAL_BYTES_READ:
-        _MEM_TOTAL_BYTES = _read_meminfo_bytes("MemTotal")
-        _MEM_TOTAL_BYTES_READ = True
-    return _MEM_TOTAL_BYTES
-
-
-def collect_memory_attributes(prefix: str) -> dict[str, int]:
-    """Collect cheap process/system memory attributes without extra deps."""
-    attrs: dict[str, int] = {}
-    rss_bytes = _read_proc_status_bytes("VmRSS")
-    if rss_bytes is not None:
-        attrs[f"{prefix}.process.memory.rss_bytes"] = rss_bytes
-
-    mem_total = _read_mem_total_bytes()
-    if mem_total is not None:
-        attrs[f"{prefix}.system.memory.total_bytes"] = mem_total
-    mem_available = _read_meminfo_bytes("MemAvailable")
-    if mem_available is not None:
-        attrs[f"{prefix}.system.memory.available_bytes"] = mem_available
-
-    try:
-        if torch.cuda.is_available():
-            device = torch.accelerator.current_device_index()
-            attrs[f"{prefix}.gpu.device"] = int(device)
-            attrs[f"{prefix}.gpu.memory.allocated_bytes"] = int(torch.cuda.memory_allocated(device))
-            attrs[f"{prefix}.gpu.memory.reserved_bytes"] = int(torch.cuda.memory_reserved(device))
-            try:
-                free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            except RuntimeError:
-                pass
-            else:
-                attrs[f"{prefix}.gpu.memory.free_bytes"] = int(free_bytes)
-                attrs[f"{prefix}.gpu.memory.total_bytes"] = int(total_bytes)
-    except (AttributeError, RuntimeError):
-        pass
-
-    return attrs
-
-
-def _traces_exporters_from_env() -> set[str]:
-    raw = os.environ.get("OTEL_TRACES_EXPORTER", "")
-    return {item.strip().lower() for item in raw.split(",") if item.strip()}
-
-
-def _configure_langfuse_otlp_env() -> None:
-    public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-    secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
-    base_url = os.environ.get("LANGFUSE_BASE_URL")
-    if not public_key or not secret_key or not base_url:
-        return
-
-    auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
-    os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", f"{base_url.rstrip('/')}/api/public/otel")
-    os.environ.setdefault("OTEL_EXPORTER_OTLP_HEADERS", f"Authorization=Basic {auth}")
-
-
-def configure_telemetry_from_env() -> None:
-    """Configure optional OpenTelemetry export for Qwen3-TTS spans.
-
-    This intentionally stays small and environment-driven. If OTEL is disabled
-    or exporter dependencies are unavailable, spans remain no-op.
-    """
-    global _OTEL_CONFIGURED
-    if _OTEL_CONFIGURED or _otel_trace is None:
-        return
-
-    exporters = _traces_exporters_from_env()
-    if not exporters or "none" in exporters:
-        _OTEL_CONFIGURED = True
-        return
-
-    try:
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.sdk.trace import TracerProvider
-    except ImportError:
-        return
-
-    provider = TracerProvider(
-        resource=Resource.create({"service.name": os.environ.get("OTEL_SERVICE_NAME", "vllm-omni")})
-    )
-    configured_exporter = False
-
-    if "otlp" in exporters:
-        try:
-            from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-                OTLPSpanExporter,
-            )
-            from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        except ImportError:
-            pass
-        else:
-            _configure_langfuse_otlp_env()
-            provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-            configured_exporter = True
-
-    if "console" in exporters:
-        try:
-            from opentelemetry.sdk.trace.export import (
-                ConsoleSpanExporter,
-                SimpleSpanProcessor,
-            )
-        except ImportError:
-            pass
-        else:
-            provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
-            configured_exporter = True
-
-    if not configured_exporter:
-        return
-
-    _otel_trace.set_tracer_provider(provider)
-    _OTEL_CONFIGURED = True
-
-
-@contextlib.contextmanager
-def telemetry_span(
-    name: str,
-    attributes: Mapping[str, Any] | None = None,
-    *,
-    capture_memory: bool = False,
-    duration_attribute: str | None = None,
-) -> Iterator[Any]:
-    """Start an optional OTEL span, falling back to a no-op without OTEL."""
-    if _otel_trace is None:
-        yield None
-        return
-
-    configure_telemetry_from_env()
-    attrs: dict[str, Any] = dict(attributes or {})
-    tracer = _otel_trace.get_tracer(_TRACER_NAME)
-    with tracer.start_as_current_span(name, attributes=attrs) as span:
-        should_collect_memory = capture_memory and span.is_recording()
-        if should_collect_memory:
-            set_span_attributes(span, collect_memory_attributes("start"))
-        duration_start_ns = time.perf_counter_ns() if duration_attribute and span.is_recording() else None
-        try:
-            yield span
-        finally:
-            if duration_attribute is not None and duration_start_ns is not None:
-                span.set_attribute(duration_attribute, (time.perf_counter_ns() - duration_start_ns) // 1000)
-            if should_collect_memory:
-                set_span_attributes(span, collect_memory_attributes("end"))
-
-
-def set_span_attributes(span: Any, attributes: Mapping[str, Any]) -> None:
-    """Set span attributes when a real span object is available."""
-    if span is None:
-        return
-    for key, value in attributes.items():
-        if value is not None:
-            span.set_attribute(key, value)
 
 
 class CodecFrameLRUCache:
@@ -526,36 +315,12 @@ class CodecFrameLRUCache:
         cache_key = normalize_cache_key(key)
         if cache_key is None:
             return None
-        with telemetry_span(
-            "qwen3_tts.continuity.cache.read",
-            {
-                "qwen3_tts.continuity.cache.key_hash": cache_key_hash(cache_key),
-                "qwen3_tts.continuity.cache.max_sessions": self.max_sessions,
-            },
-            capture_memory=False,
-            duration_attribute="qwen3_tts.continuity.cache.duration_us",
-        ) as span:
-            with self._lock:
-                frames = self._items.get(cache_key)
-                hit = frames is not None
-                set_span_attributes(
-                    span,
-                    {
-                        "qwen3_tts.continuity.cache.hit": hit,
-                        "qwen3_tts.continuity.cache.size": len(self._items),
-                    },
-                )
-                if frames is None:
-                    return None
-                self._items.move_to_end(cache_key)
-                set_span_attributes(
-                    span,
-                    {
-                        "qwen3_tts.continuity.codec.frames": int(frames.shape[0]),
-                        "qwen3_tts.continuity.codec.quantizers": int(frames.shape[1]),
-                    },
-                )
-                return frames.clone()
+        with self._lock:
+            frames = self._items.get(cache_key)
+            if frames is None:
+                return None
+            self._items.move_to_end(cache_key)
+            return frames.clone()
 
     def put(self, key: str, frames: object) -> bool:
         cache_key = normalize_cache_key(key)
@@ -565,31 +330,11 @@ class CodecFrameLRUCache:
         if normalized is None:
             return False
         normalized = normalized.cpu().contiguous()
-        with telemetry_span(
-            "qwen3_tts.continuity.cache.write",
-            {
-                "qwen3_tts.continuity.cache.key_hash": cache_key_hash(cache_key),
-                "qwen3_tts.continuity.cache.max_sessions": self.max_sessions,
-                "qwen3_tts.continuity.codec.frames": int(normalized.shape[0]),
-                "qwen3_tts.continuity.codec.quantizers": int(normalized.shape[1]),
-            },
-            capture_memory=False,
-            duration_attribute="qwen3_tts.continuity.cache.duration_us",
-        ) as span:
-            evicted = 0
-            with self._lock:
-                self._items[cache_key] = normalized
-                self._items.move_to_end(cache_key)
-                while len(self._items) > self.max_sessions:
-                    self._items.popitem(last=False)
-                    evicted += 1
-                set_span_attributes(
-                    span,
-                    {
-                        "qwen3_tts.continuity.cache.size": len(self._items),
-                        "qwen3_tts.continuity.cache.evicted": evicted,
-                    },
-                )
+        with self._lock:
+            self._items[cache_key] = normalized
+            self._items.move_to_end(cache_key)
+            while len(self._items) > self.max_sessions:
+                self._items.popitem(last=False)
         return True
 
     def __len__(self) -> int:
