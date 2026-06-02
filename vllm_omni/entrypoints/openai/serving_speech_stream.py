@@ -19,7 +19,6 @@ Protocol:
 
 import asyncio
 import json
-from contextlib import aclosing
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
@@ -82,7 +81,12 @@ class OmniStreamingSpeechHandler:
             # Validate model if specified
             if config.model and hasattr(self._speech_service, "_check_model"):
                 error = await self._speech_service._check_model(
-                    OpenAICreateSpeechRequest(input="ping", model=config.model)
+                    OpenAICreateSpeechRequest(
+                        input="ping",
+                        request_id=f"{config.request_id}:model-check",
+                        session_id=config.session_id,
+                        model=config.model,
+                    )
                 )
                 if error is not None:
                     await self._send_error(websocket, str(error))
@@ -212,6 +216,8 @@ class OmniStreamingSpeechHandler:
 
         request = OpenAICreateSpeechRequest(
             input=sentence_text,
+            request_id=f"{config.request_id}:{sentence_index}",
+            session_id=config.session_id,
             model=config.model,
             voice=config.voice,
             task_type=config.task_type,
@@ -244,10 +250,13 @@ class OmniStreamingSpeechHandler:
         try:
             if config.stream_audio:
                 request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
-                async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                stream = self._speech_service._generate_pcm_chunks(generator, request_id, request)
+                try:
                     async for chunk in stream:
                         total_bytes += len(chunk)
                         await websocket.send_bytes(chunk)
+                finally:
+                    await stream.aclose()
             else:
                 audio_bytes, _ = await self._speech_service._generate_audio_bytes(request)
                 total_bytes = len(audio_bytes)

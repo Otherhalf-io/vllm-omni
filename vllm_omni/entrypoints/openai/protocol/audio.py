@@ -9,6 +9,13 @@ _MAX_EMBEDDING_DIM = 8192
 
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
+    request_id: str = Field(
+        description="Caller-provided request id used as the vLLM engine request id.",
+    )
+    session_id: str | None = Field(
+        default=None,
+        description="Caller-provided continuity session id. Omit for stateless speech.",
+    )
     model: str | None = None
     # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
     # convention) as input keys.  Intentionally global — all TTS backends
@@ -107,6 +114,16 @@ class OpenAICreateSpeechRequest(BaseModel):
         if v == "sse":
             raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
+
+    @field_validator("request_id", "session_id")
+    @classmethod
+    def validate_identifier(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        normalized = v.strip()
+        if not normalized:
+            raise ValueError("identifier fields must not be blank")
+        return normalized
 
     @field_validator("speaker_embedding")
     @classmethod
@@ -248,10 +265,15 @@ class AudioResponse(BaseModel):
 
 
 class SpeechBatchItem(BaseModel):
-    """Per-item input for batch speech. Only `input` is required;
-    all other fields override the batch-level defaults when set."""
+    """Per-item input for batch speech.
+
+    `input` and `request_id` are required; all other fields override the
+    batch-level defaults when set.
+    """
 
     input: str
+    request_id: str
+    session_id: str | None = None
     voice: str | None = None
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
@@ -264,12 +286,18 @@ class SpeechBatchItem(BaseModel):
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
 
+    @field_validator("request_id", "session_id")
+    @classmethod
+    def validate_identifier(cls, v: str | None) -> str | None:
+        return OpenAICreateSpeechRequest.validate_identifier(v)
+
 
 class BatchSpeechRequest(BaseModel):
     """Top-level request for batch speech generation.
     Fields here act as shared defaults; per-item overrides win."""
 
     model: str | None = None
+    session_id: str | None = None
     items: list[SpeechBatchItem] = Field(..., min_length=1)
     voice: str | None = None
     instructions: str | None = None
@@ -282,6 +310,11 @@ class BatchSpeechRequest(BaseModel):
     x_vector_only_mode: bool | None = None
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str | None) -> str | None:
+        return OpenAICreateSpeechRequest.validate_identifier(v)
 
 
 class SpeechBatchItemResult(BaseModel):
@@ -303,6 +336,8 @@ class BatchSpeechResponse(BaseModel):
 class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
+    request_id: str
+    session_id: str | None = None
     model: str | None = None
     voice: str | None = None
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
@@ -338,6 +373,11 @@ class StreamingSpeechSessionConfig(BaseModel):
             "'clause' also splits on CJK commas ， and semicolons ；."
         ),
     )
+
+    @field_validator("request_id", "session_id")
+    @classmethod
+    def validate_identifier(cls, v: str | None) -> str | None:
+        return OpenAICreateSpeechRequest.validate_identifier(v)
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":
