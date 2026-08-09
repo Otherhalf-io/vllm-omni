@@ -16,13 +16,15 @@ several paragraphs, synthesized as a single request.
 
 Protocol:
     Client -> Server:
-        {"type": "session.config", ...}   # Session config (first message; repeatable)
+        {"type": "session.config", "request_id": "speech-ws-001", ...}
+                                             # Session config (first message; repeatable)
         {"type": "input.text", "text": "..."} # Text chunks
         {"type": "input.done"}            # End of utterance, flush and keep connection open
         {"type": "session.close"}         # End of connection
 
     Server -> Client (default, word_timestamps=false):
-        {"type": "audio.start", "utterance_index": 0, "sentence_index": 0,
+        {"type": "audio.start", "request_id": "speech-ws-001-0-0",
+         "utterance_index": 0, "sentence_index": 0,
          "sentence_text": "...", "format": "wav"}
         <binary frame: audio bytes>
         ...
@@ -291,6 +293,8 @@ class OmniStreamingSpeechHandler:
 
         request = OpenAICreateSpeechRequest(
             input=sentence_text,
+            request_id=f"{config.request_id}-{utterance_index}-{sentence_index}",
+            session_id=config.session_id,
             model=config.model,
             voice=config.voice,
             task_type=config.task_type,
@@ -311,6 +315,7 @@ class OmniStreamingSpeechHandler:
 
         start_payload = {
             "type": "audio.start",
+            "request_id": request.request_id,
             "utterance_index": utterance_index,
             "sentence_index": sentence_index,
             "sentence_text": sentence_text,
@@ -326,7 +331,7 @@ class OmniStreamingSpeechHandler:
 
         total_bytes = 0
         generation_failed = False
-        request_id = None
+        request_id = request.request_id
         try:
             if config.stream_audio:
                 request_id, generator, _ = await self._speech_service._prepare_speech_generation(request)
@@ -339,9 +344,16 @@ class OmniStreamingSpeechHandler:
                         utterance_index=utterance_index,
                         sentence_index=sentence_index,
                         language=config.language,
+                        session_id=config.session_id,
                     )
                 else:
-                    async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
+                    async with aclosing(
+                        self._speech_service._generate_pcm_chunks(
+                            generator,
+                            request_id,
+                            session_id=config.session_id,
+                        )
+                    ) as stream:
                         async for chunk in stream:
                             total_bytes += len(chunk)
                             await websocket.send_bytes(chunk)
@@ -392,6 +404,7 @@ class OmniStreamingSpeechHandler:
         utterance_index: int,
         sentence_index: int,
         language: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         """Stream PCM as JSON ``audio.chunk`` frames, aligned per sentence.
 
@@ -437,6 +450,7 @@ class OmniStreamingSpeechHandler:
                 generator,
                 request_id,
                 include_sample_rate=True,
+                session_id=session_id,
             )
         ) as stream:
             async for chunk, chunk_sample_rate in stream:

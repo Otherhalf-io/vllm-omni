@@ -50,6 +50,8 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
+        "request_id": "speech-example-001",
+        "session_id": "session-example",
         "input": "Hello, how are you?",
         "voice": "vivian",
         "language": "English"
@@ -64,6 +66,8 @@ import httpx
 response = httpx.post(
     "http://localhost:8091/v1/audio/speech",
     json={
+        "request_id": "speech-example-001",
+        "session_id": "session-example",
         "input": "Hello, how are you?",
         "voice": "vivian",
         "language": "English",
@@ -86,6 +90,7 @@ response = client.audio.speech.create(
     model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
     voice="vivian",
     input="Hello, how are you?",
+    extra_body={"request_id": "speech-example-002", "session_id": "session-example"},
 )
 
 response.stream_to_file("output.wav")
@@ -107,6 +112,8 @@ Content-Type: application/json
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input` | string | **required** | The text to synthesize into speech |
+| `request_id` | string | **required** | Caller-owned request ID used unchanged by generation, cancellation, and logs |
+| `session_id` | string | null | Optional caller-owned correlation ID; it does not create server-side continuity state |
 | `model` | string | server's model | Model to use (optional, should match server if specified) |
 | `voice` | string | "vivian" | Speaker name (e.g., vivian, ryan, aiden) |
 | `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, opus |
@@ -276,7 +283,7 @@ Client -> Server:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "session.config", ...}` | Session configuration (first message; may be resent between utterances to change it) |
+| `{"type": "session.config", "request_id": "speech-ws-001", ...}` | Session configuration (first message; may be resent between utterances to change it) |
 | `{"type": "input.text", "text": "..."}` | Text chunk |
 | `{"type": "input.done"}` | End of utterance: flushes the buffer and keeps the connection open |
 | `{"type": "session.close"}` | End of connection |
@@ -285,7 +292,7 @@ Server -> Client:
 
 | Message | Description |
 |---------|-------------|
-| `{"type": "audio.start", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
+| `{"type": "audio.start", "request_id": "speech-ws-001-0-0", "utterance_index": 0, "sentence_index": 0, "sentence_text": "...", "format": "pcm", "sample_rate": 24000}` | Audio generation starting for the buffered input |
 | Binary frame | Raw audio bytes (one or more PCM chunks when `stream_audio=true`) |
 | `{"type": "audio.done", "utterance_index": 0, "sentence_index": 0, "total_bytes": 96000, "error": false}` | Audio complete for the buffered input |
 | `{"type": "session.done", "utterance_index": 0, "total_sentences": N}` | Flushed utterance complete |
@@ -318,6 +325,8 @@ All REST API parameters are supported, plus:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `request_id` | string | **required** | Caller-owned prefix; generated requests use `<request_id>-<utterance_index>-<sentence_index>` |
+| `session_id` | string | null | Optional caller-owned correlation ID propagated to requests and logs |
 | `stream_audio` | bool | false | Stream one or more PCM chunks for the buffered input over WebSocket |
 
 
@@ -524,6 +533,8 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `request_id` | string | **required** | Caller-owned batch ID; item generation IDs are `<request_id>-<index>` |
+| `session_id` | string | null | Optional caller-owned correlation ID propagated to every item |
 | `items` | array | **required** | List of items to synthesize (1–32) |
 | `model` | string | server's model | Model to use |
 | `voice` | string | null | Default voice for all items |
@@ -557,7 +568,7 @@ Each item in the `items` array requires only `input` (the text). All other field
 
 ```json
 {
-    "id": "speech-batch-abc123",
+    "id": "speech-batch-example",
     "results": [
         {
             "index": 0,
@@ -603,6 +614,7 @@ of the single endpoint's [SSE stream](#response-format) (`stream_format="sse"`).
 curl -X POST http://localhost:8091/v1/audio/speech/batch \
     -H "Content-Type: application/json" \
     -d '{
+        "request_id": "speech-batch-basic",
         "items": [
             {"input": "Hello, how are you?"},
             {"input": "Goodbye, see you later!"}
@@ -618,6 +630,7 @@ curl -X POST http://localhost:8091/v1/audio/speech/batch \
 curl -X POST http://localhost:8091/v1/audio/speech/batch \
     -H "Content-Type: application/json" \
     -d '{
+        "request_id": "speech-batch-overrides",
         "items": [
             {"input": "Hello!", "voice": "vivian", "response_format": "mp3"},
             {"input": "你好！", "voice": "ryan", "language": "Chinese"}
@@ -632,6 +645,7 @@ curl -X POST http://localhost:8091/v1/audio/speech/batch \
 curl -X POST http://localhost:8091/v1/audio/speech/batch \
     -H "Content-Type: application/json" \
     -d '{
+        "request_id": "speech-batch-clone",
         "items": [
             {"input": "First sentence in the cloned voice."},
             {"input": "Second sentence in the cloned voice."}
@@ -653,6 +667,7 @@ import httpx
 response = httpx.post(
     "http://localhost:8091/v1/audio/speech/batch",
     json={
+        "request_id": "speech-batch-python",
         "items": [
             {"input": "First sentence."},
             {"input": "Second sentence."},

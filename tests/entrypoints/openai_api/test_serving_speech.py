@@ -360,6 +360,7 @@ class TestSpeechAPI:
     def test_create_speech_success(self, client):
         payload = {
             "input": "Hello world",
+            "request_id": "test-create-speech-wav",
             "model": "tts-model",
             "voice": "alloy",
             "response_format": "wav",
@@ -372,6 +373,7 @@ class TestSpeechAPI:
     def test_create_speech_mp3_format(self, client):
         payload = {
             "input": "Hello world",
+            "request_id": "test-create-speech-mp3",
             "model": "tts-model",
             "voice": "alloy",
             "response_format": "mp3",
@@ -404,6 +406,7 @@ class TestSpeechAPI:
 
         payload = {
             "input": "This should be fast.",
+            "request_id": "test-create-speech-speed",
             "model": "tts-model",
             "voice": "alloy",
             "response_format": "wav",
@@ -702,8 +705,14 @@ class TestSpeechAPI:
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )
 
-        req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
+        req = OpenAICreateSpeechRequest(
+            input="Hello",
+            request_id="test-diffusion-extra-params",
+            session_id="test-diffusion-session",
+            extra_params={"new_arg": 123, "existing_arg": "new_value"},
+        )
 
+        info_log = mocker.patch.object(serving_speech_module.logger, "info")
         await server._create_diffusion_speech(req)
 
         # Verify generate was called
@@ -716,6 +725,13 @@ class TestSpeechAPI:
         # Verify it was deepcopied and updated
         assert passed_params is not mock_engine.default_sampling_params_list
         assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
+        info_log.assert_any_call(
+            "Diffusion TTS speech request %s: session_id=%s text=%r, voice_clone=%s",
+            "test-diffusion-extra-params",
+            "test-diffusion-session",
+            "Hello",
+            False,
+        )
 
 
 class TestTTSMethods:
@@ -788,7 +804,7 @@ class TestTTSMethods:
         )
         assert server._is_tts is False
 
-        request = OpenAICreateSpeechRequest(input="Hello world")
+        request = OpenAICreateSpeechRequest(input="Hello world", request_id="test-non-tts-model")
         with pytest.raises(ValueError, match="only supported for dedicated TTS models"):
             asyncio.run(server._prepare_speech_generation(request))
         server.shutdown()
@@ -1262,7 +1278,11 @@ class TestTTSMethods:
         )
 
         with pytest.raises(ValueError, match="Invalid voice 'bob'"):
-            asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Bob")))
+            asyncio.run(
+                speech_server._prepare_speech_generation(
+                    OpenAICreateSpeechRequest(input="Hello", request_id="test-voice-bob", voice="Bob")
+                )
+            )
 
         speech_server._build_voxcpm2_prompt.assert_not_awaited()
         speech_server.engine_client.generate.assert_not_called()
@@ -1279,7 +1299,11 @@ class TestTTSMethods:
             return_value={"prompt_token_ids": [1], "additional_information": {}}
         )
 
-        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="default")))
+        asyncio.run(
+            speech_server._prepare_speech_generation(
+                OpenAICreateSpeechRequest(input="Hello", request_id="test-voice-default", voice="default")
+            )
+        )
 
         speech_server._build_voxcpm2_prompt.assert_awaited_once()
         speech_server.engine_client.generate.assert_called_once()
@@ -1308,7 +1332,11 @@ class TestTTSMethods:
             }
         )
 
-        asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello", voice="Alice")))
+        asyncio.run(
+            speech_server._prepare_speech_generation(
+                OpenAICreateSpeechRequest(input="Hello", request_id="test-voice-alice", voice="Alice")
+            )
+        )
 
         prompt = speech_server.engine_client.generate.call_args.kwargs["prompt"]
         additional = prompt["additional_information"]
@@ -2093,15 +2121,42 @@ class TestTTSMethods:
         speech_server._validate_tts_request = mocker.Mock(side_effect=validate_and_resolve_uploaded_voice)
         speech_server._generate_audio_bytes = mocker.AsyncMock(return_value=("YWJj", "audio/wav"))
 
-        batch = BatchSpeechRequest(voice="alice", items=[SpeechBatchItem(input="hello")])
+        batch = BatchSpeechRequest(
+            request_id="test-batch-uploaded-voice",
+            session_id="test-batch-session",
+            voice="alice",
+            items=[SpeechBatchItem(input="hello")],
+        )
 
+        info_log = mocker.patch.object(serving_speech_module.logger, "info")
         response = asyncio.run(speech_server.create_speech_batch(batch))
         call = speech_server._generate_audio_bytes.await_args
         request = call.args[0]
 
         assert response.results[0].status == "success"
         assert request.ref_audio is not None
+        assert request.request_id == "test-batch-uploaded-voice-0"
         assert call.kwargs["has_inline_ref_audio"] is False
+        info_log.assert_any_call(
+            "[SpeechE2E] request_id=%s session_id=%s stream=false batch=true status=ok",
+            "test-batch-uploaded-voice-0",
+            "test-batch-session",
+        )
+
+    def test_create_speech_rejects_missing_caller_request_id(self, speech_server, mocker: MockerFixture):
+        speech_server._check_model = mocker.AsyncMock(return_value=None)
+
+        response = asyncio.run(speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello")))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == 400
+        assert response.error.message == "request_id must be a non-empty string for speech requests"
+
+    def test_internal_generation_rejects_missing_explicit_request_id(self, speech_server):
+        with pytest.raises(ValueError, match="request_id must be a non-empty string"):
+            asyncio.run(speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="Hello")))
+
+        speech_server.engine_client.generate.assert_not_called()
 
 
 class TestFileValidationFunctions:
@@ -2303,7 +2358,15 @@ class TestStreamingResponse:
     def test_streaming(self, streaming_app):
         """stream=True defaults to OpenAI speech.audio.* SSE events."""
         client = TestClient(streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-sse-default",
+                "stream": True,
+                "response_format": "pcm",
+            },
+        )
         self._assert_sse_audio_response(response)
 
     def test_stream_format_audio_streaming(self, streaming_app):
@@ -2311,7 +2374,12 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post(
             "/v1/audio/speech",
-            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm"},
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-raw-audio",
+                "stream_format": "audio",
+                "response_format": "pcm",
+            },
         )
         assert response.status_code == 200
         assert "audio/pcm" in response.headers["content-type"]
@@ -2323,7 +2391,12 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post(
             "/v1/audio/speech",
-            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-sse-explicit",
+                "stream_format": "sse",
+                "response_format": "pcm",
+            },
         )
 
         self._assert_sse_audio_response(response)
@@ -2333,7 +2406,13 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post(
             "/v1/audio/speech",
-            json={"input": "Hello", "stream": True, "stream_format": "sse", "response_format": "pcm"},
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-sse-both",
+                "stream": True,
+                "stream_format": "sse",
+                "response_format": "pcm",
+            },
         )
 
         self._assert_sse_audio_response(response)
@@ -2343,7 +2422,13 @@ class TestStreamingResponse:
         client = TestClient(streaming_app)
         response = client.post(
             "/v1/audio/speech",
-            json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": "pcm"},
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-raw-both",
+                "stream": True,
+                "stream_format": "audio",
+                "response_format": "pcm",
+            },
         )
 
         assert response.status_code == 200
@@ -2434,7 +2519,12 @@ class TestStreamingResponse:
         client = TestClient(erroring_streaming_app)
         response = client.post(
             "/v1/audio/speech",
-            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-sse-error",
+                "stream_format": "sse",
+                "response_format": "pcm",
+            },
         )
 
         assert response.status_code == 200
@@ -2450,7 +2540,14 @@ class TestStreamingResponse:
     def test_non_streaming_unchanged(self, streaming_app):
         """Non-streaming path must still return audio/wav."""
         client = TestClient(streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "response_format": "wav"})
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "input": "Hello",
+                "request_id": "test-non-streaming",
+                "response_format": "wav",
+            },
+        )
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
 
@@ -2461,6 +2558,7 @@ class TestSpeechBatchAPI:
     def test_batch_success(self, client):
         """Batch with two items should return two successful results with base64 audio."""
         payload = {
+            "request_id": "test-batch-success",
             "items": [
                 {"input": "Hello world"},
                 {"input": "Goodbye world"},
@@ -2484,7 +2582,7 @@ class TestSpeechBatchAPI:
 
     def test_batch_single_item(self, client):
         """Batch with a single item should work."""
-        payload = {"items": [{"input": "Solo"}]}
+        payload = {"request_id": "test-batch-single", "items": [{"input": "Solo"}]}
         response = client.post("/v1/audio/speech/batch", json=payload)
         assert response.status_code == 200
         body = response.json()
@@ -2493,18 +2591,21 @@ class TestSpeechBatchAPI:
 
     def test_batch_empty_items_rejected(self, client):
         """Empty items list should be rejected by Pydantic validation."""
-        response = client.post("/v1/audio/speech/batch", json={"items": []})
+        response = client.post(
+            "/v1/audio/speech/batch",
+            json={"request_id": "test-batch-empty", "items": []},
+        )
         assert response.status_code == 422
 
     def test_batch_too_many_items(self, client):
         """Exceeding the batch max items limit (default 32) should be rejected."""
-        payload = {"items": [{"input": f"text {i}"} for i in range(33)]}
+        payload = {"request_id": "test-batch-too-many", "items": [{"input": f"text {i}"} for i in range(33)]}
         with pytest.raises(ValueError, match="exceeding the maximum"):
             client.post("/v1/audio/speech/batch", json=payload)
 
     def test_batch_max_items_allowed(self, client):
         """Exactly 32 items should be accepted."""
-        payload = {"items": [{"input": f"text {i}"} for i in range(32)]}
+        payload = {"request_id": "test-batch-max", "items": [{"input": f"text {i}"} for i in range(32)]}
         response = client.post("/v1/audio/speech/batch", json=payload)
         assert response.status_code == 200
         body = response.json()
@@ -2513,18 +2614,18 @@ class TestSpeechBatchAPI:
 
     def test_batch_results_have_correct_indices(self, client):
         """Each result should have an index matching its position."""
-        payload = {"items": [{"input": f"text {i}"} for i in range(3)]}
+        payload = {"request_id": "test-batch-indices", "items": [{"input": f"text {i}"} for i in range(3)]}
         response = client.post("/v1/audio/speech/batch", json=payload)
         body = response.json()
         indices = [r["index"] for r in body["results"]]
         assert indices == [0, 1, 2]
 
     def test_batch_response_has_id(self, client):
-        """Batch response should have a unique id starting with 'speech-batch-'."""
-        payload = {"items": [{"input": "Hello"}]}
+        """Batch response should preserve the caller-owned id."""
+        payload = {"request_id": "test-batch-response", "items": [{"input": "Hello"}]}
         response = client.post("/v1/audio/speech/batch", json=payload)
         body = response.json()
-        assert body["id"].startswith("speech-batch-")
+        assert body["id"] == "test-batch-response"
 
 
 class TestMergeBatchItem:
@@ -2533,6 +2634,7 @@ class TestMergeBatchItem:
     def test_item_override_wins(self):
         """Per-item voice should override batch-level voice."""
         batch = BatchSpeechRequest(
+            request_id="test-batch-item-override",
             items=[SpeechBatchItem(input="hi", voice="Ryan")],
             voice="Vivian",
         )
@@ -2542,6 +2644,7 @@ class TestMergeBatchItem:
     def test_batch_default_used(self):
         """Batch-level voice should be used when item doesn't specify one."""
         batch = BatchSpeechRequest(
+            request_id="test-batch-default",
             items=[SpeechBatchItem(input="hi")],
             voice="Vivian",
         )
@@ -2551,6 +2654,7 @@ class TestMergeBatchItem:
     def test_response_format_override(self):
         """Per-item response_format should override batch default."""
         batch = BatchSpeechRequest(
+            request_id="test-batch-format",
             items=[SpeechBatchItem(input="hi", response_format="mp3")],
             response_format="wav",
         )
@@ -2559,13 +2663,14 @@ class TestMergeBatchItem:
 
     def test_stream_always_false(self):
         """Merged requests should always have stream=False."""
-        batch = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
+        batch = BatchSpeechRequest(request_id="test-batch-stream", items=[SpeechBatchItem(input="hi")])
         merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
         assert merged.stream is False
 
     def test_all_fields_merge(self):
         """All overridable fields should merge correctly."""
         batch = BatchSpeechRequest(
+            request_id="test-batch-all-fields",
             items=[
                 SpeechBatchItem(
                     input="hello",
@@ -2590,6 +2695,7 @@ class TestMergeBatchItem:
     def test_non_streaming_mode_batch_default_used(self):
         """Batch-level non_streaming_mode should be used when item doesn't specify one."""
         batch = BatchSpeechRequest(
+            request_id="test-batch-mode-default",
             items=[SpeechBatchItem(input="hi")],
             non_streaming_mode=True,
         )
@@ -2601,6 +2707,7 @@ class TestMergeBatchItem:
     def test_non_streaming_mode_item_override_wins(self):
         """Per-item false should override a true batch-level default."""
         batch = BatchSpeechRequest(
+            request_id="test-batch-mode-override",
             items=[SpeechBatchItem(input="hi", non_streaming_mode=False)],
             non_streaming_mode=True,
         )
@@ -2611,7 +2718,7 @@ class TestMergeBatchItem:
 
 
 def test_streaming_speech_session_config_accepts_non_streaming_mode():
-    config = StreamingSpeechSessionConfig(non_streaming_mode=True)
+    config = StreamingSpeechSessionConfig(request_id="test-ws-config", non_streaming_mode=True)
 
     assert config.non_streaming_mode is True
 
@@ -2886,7 +2993,7 @@ def test_api_server_create_speech_batch_without_handler_returns_404(mocker: Mock
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/speech/batch")
     raw_request.app.state.serving_tokenization = fake_base
-    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
+    request = BatchSpeechRequest(request_id="test-batch-no-handler", items=[SpeechBatchItem(input="hi")])
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
 
@@ -2931,7 +3038,10 @@ def test_api_server_create_speech_batch_omits_null_fields(mocker: MockerFixture)
         )
     )
     raw_request = _make_api_server_request(handler, path="/v1/audio/speech/batch")
-    request = BatchSpeechRequest(items=[SpeechBatchItem(input="hi"), SpeechBatchItem(input="")])
+    request = BatchSpeechRequest(
+        request_id="test-batch-null-fields",
+        items=[SpeechBatchItem(input="hi"), SpeechBatchItem(input="")],
+    )
 
     response = asyncio.run(api_server_module.create_speech_batch(request, raw_request))
 
@@ -3253,10 +3363,14 @@ class TestFishSpeechServing:
         )
 
         fish_speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
-        request = OpenAICreateSpeechRequest(input="hello fish", max_new_tokens=4096)
+        request = OpenAICreateSpeechRequest(
+            input="hello fish",
+            request_id="test-fish-max-tokens",
+            max_new_tokens=4096,
+        )
         request_id, generator, _ = asyncio.run(fish_speech_server._prepare_speech_generation(request))
 
-        assert request_id.startswith("speech-")
+        assert request_id == "test-fish-max-tokens"
         assert generator == "generator"
         fish_speech_server._build_fish_speech_prompt_async.assert_awaited_once()
         fish_speech_server.engine_client.generate.assert_called_once()
@@ -3274,10 +3388,12 @@ class TestFishSpeechServing:
 
         fish_speech_server.engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
         request_id, generator, _ = asyncio.run(
-            fish_speech_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello fish"))
+            fish_speech_server._prepare_speech_generation(
+                OpenAICreateSpeechRequest(input="hello fish", request_id="test-fish-generate")
+            )
         )
 
-        assert request_id.startswith("speech-")
+        assert request_id == "test-fish-generate"
         assert generator == "generator"
         sampling_params_list = fish_speech_server.engine_client.generate.call_args.kwargs["sampling_params_list"]
         assert sampling_params_list[0].max_tokens == 2048
@@ -3290,7 +3406,11 @@ class TestFishSpeechServing:
         with pytest.raises(ValueError, match="max_new_tokens cannot exceed"):
             asyncio.run(
                 fish_speech_server._prepare_speech_generation(
-                    OpenAICreateSpeechRequest(input="hello fish", max_new_tokens=999999)
+                    OpenAICreateSpeechRequest(
+                        input="hello fish",
+                        request_id="test-fish-invalid-tokens",
+                        max_new_tokens=999999,
+                    )
                 )
             )
 
@@ -3300,7 +3420,7 @@ class TestFishSpeechServing:
         fish_speech_server._check_model = mocker.AsyncMock(return_value=None)
         fish_speech_server._generate_audio_bytes = mocker.AsyncMock(return_value=("YWJj", "audio/wav"))
 
-        batch = BatchSpeechRequest(items=[SpeechBatchItem(input="hello fish")])
+        batch = BatchSpeechRequest(request_id="test-batch-fish", items=[SpeechBatchItem(input="hello fish")])
         response = asyncio.run(fish_speech_server.create_speech_batch(batch))
 
         assert response.results[0].status == "success"
@@ -3383,7 +3503,13 @@ class TestWAVStreaming:
         client = TestClient(wav_streaming_app)
         response = client.post(
             "/v1/audio/speech",
-            json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": "wav"},
+            json={
+                "input": "Hello",
+                "request_id": "test-stream-wav",
+                "stream": True,
+                "stream_format": "audio",
+                "response_format": "wav",
+            },
         )
 
         assert response.status_code == 200
@@ -3493,6 +3619,7 @@ class TestCosyVoice3Serving:
     def test_validate_cosyvoice3_max_new_tokens_range(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(
             input="Hello",
+            request_id="test-cosyvoice-generate",
             ref_audio="data:audio/wav;base64,abc",
             ref_text="hello",
             max_new_tokens=0,
@@ -3513,12 +3640,13 @@ class TestCosyVoice3Serving:
 
         request = OpenAICreateSpeechRequest(
             input="Hello",
+            request_id="test-cosyvoice-generate",
             ref_audio="data:audio/wav;base64,abc",
             ref_text="Reference text",
         )
         request_id, generator, tts_params = asyncio.run(cosyvoice3_server._prepare_speech_generation(request))
 
-        assert request_id.startswith("speech-")
+        assert request_id == "test-cosyvoice-generate"
         assert generator == "generator"
         assert tts_params == {}
         cosyvoice3_server._build_cosyvoice3_prompt.assert_awaited_once()
@@ -3654,7 +3782,7 @@ class TestMingFlashOmniTTSServing:
                 "additional_information": {"voice": ["test"]},
             }
         )
-        request = OpenAICreateSpeechRequest(input="Hello", voice="test")
+        request = OpenAICreateSpeechRequest(input="Hello", request_id="test-ming-generate", voice="test")
         asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
         ming_flash_omni_tts_server._build_ming_flash_omni_prompt.assert_called_once()
 
@@ -3727,7 +3855,7 @@ class TestTTSAsyncOffloading:
                 "additional_information": {"voice": ["test"]},
             }
         )
-        request = OpenAICreateSpeechRequest(input="hello", voice="test")
+        request = OpenAICreateSpeechRequest(input="hello", request_id="test-voxtral-async", voice="test")
         asyncio.run(voxtral_server._prepare_speech_generation(request))
         voxtral_server._build_voxtral_prompt_async.assert_awaited_once()
 
@@ -3738,7 +3866,7 @@ class TestTTSAsyncOffloading:
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
         qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
-        request = OpenAICreateSpeechRequest(input="hello")
+        request = OpenAICreateSpeechRequest(input="hello", request_id="test-qwen-async")
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
@@ -3755,7 +3883,7 @@ class TestTTSAsyncOffloading:
             return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
         )
         qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
-        request = OpenAICreateSpeechRequest(input="hello")
+        request = OpenAICreateSpeechRequest(input="hello", request_id="test-qwen-default-seed")
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
@@ -3788,7 +3916,11 @@ class TestTTSAsyncOffloading:
         mocker.patch.object(voxtral_server, "_get_tts_adapter", return_value=FakeAdapter())
         log_info = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.info")
 
-        asyncio.run(voxtral_server._prepare_speech_generation(OpenAICreateSpeechRequest(input="hello")))
+        asyncio.run(
+            voxtral_server._prepare_speech_generation(
+                OpenAICreateSpeechRequest(input="hello", request_id="test-voxtral-generate")
+            )
+        )
 
         assert adapter_model_type != legacy_tts_model_type
         assert any(
@@ -3809,7 +3941,11 @@ class TestTTSAsyncOffloading:
             "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
-        request = OpenAICreateSpeechRequest(input="hello", stream_format="sse")
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            request_id="test-qwen-sse",
+            stream_format="sse",
+        )
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
@@ -3826,7 +3962,12 @@ class TestTTSAsyncOffloading:
             "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
-        request = OpenAICreateSpeechRequest(input="hello", stream=True, response_format="pcm")
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            request_id="test-qwen-stream",
+            stream=True,
+            response_format="pcm",
+        )
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
@@ -3843,7 +3984,12 @@ class TestTTSAsyncOffloading:
             "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
-        request = OpenAICreateSpeechRequest(input="hello", stream_format="audio", response_format="pcm")
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            request_id="test-qwen-audio-stream",
+            stream_format="audio",
+            response_format="pcm",
+        )
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
@@ -3863,7 +4009,12 @@ class TestTTSAsyncOffloading:
             "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
-        request = OpenAICreateSpeechRequest(input="hello", stream_format="audio", response_format="pcm")
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            request_id="test-qwen-final-only",
+            stream_format="audio",
+            response_format="pcm",
+        )
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 
@@ -3885,7 +4036,13 @@ class TestTTSAsyncOffloading:
             "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
             return_value=voxtral_server.engine_client.default_sampling_params_list,
         )
-        request = OpenAICreateSpeechRequest(input="hello", voice="test", stream_format="audio", response_format="pcm")
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            request_id="test-voxtral-delta",
+            voice="test",
+            stream_format="audio",
+            response_format="pcm",
+        )
 
         asyncio.run(voxtral_server._prepare_speech_generation(request))
 
@@ -3900,6 +4057,7 @@ class TestTTSAsyncOffloading:
 
         request = OpenAICreateSpeechRequest(
             input="hello",
+            request_id="test-qwen-voice-design-mode",
             task_type="VoiceDesign",
             instructions="warm and calm",
             non_streaming_mode=False,
@@ -3923,6 +4081,7 @@ class TestTTSAsyncOffloading:
 
         request = OpenAICreateSpeechRequest(
             input="hello",
+            request_id="test-qwen-base-mode",
             task_type="Base",
             ref_audio="data:audio/wav;base64,abc",
             ref_text="reference transcript",

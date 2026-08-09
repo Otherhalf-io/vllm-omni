@@ -53,6 +53,7 @@ def make_batch_request(
     """Make a request to the /v1/audio/speech/batch endpoint."""
     url = f"http://{host}:{port}/v1/audio/speech/batch"
     payload: dict = {
+        "request_id": f"test-speech-batch-{time.time_ns()}",
         "items": items,
         "response_format": response_format,
     }
@@ -108,7 +109,7 @@ class TestSpeechBatchE2E:
         assert data["total"] == 2
         assert data["succeeded"] == 2
         assert data["failed"] == 0
-        assert data["id"].startswith("speech-batch-")
+        assert data["id"].startswith("test-speech-batch-")
         assert len(data["results"]) == 2
 
         for i, result in enumerate(data["results"]):
@@ -267,7 +268,7 @@ class TestSpeechBatchValidation:
     def test_batch_empty_items_rejected(self, omni_server) -> None:
         """Empty items list returns a 4xx error."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech/batch"
-        payload = {"items": [], "voice": "vivian"}
+        payload = {"request_id": "test-batch-empty", "items": [], "voice": "vivian"}
 
         with httpx.Client(timeout=30.0) as client:
             response = client.post(url, json=payload)

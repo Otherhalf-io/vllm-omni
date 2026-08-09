@@ -373,7 +373,7 @@ The WebSocket protocol uses `audio.start` / binary PCM chunks / `audio.done` fra
 
 ```json
 // Client sends:
-{"type":"session.config","voice":"Vivian","response_format":"pcm","stream_audio":true}
+{"type":"session.config","request_id":"speech-perf-001","voice":"Vivian","response_format":"pcm","stream_audio":true}
 {"type":"input.text","text":"Hello world. This is a streaming demo."}
 {"type":"input.done"}
 
