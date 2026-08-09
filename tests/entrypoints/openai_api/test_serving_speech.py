@@ -1243,6 +1243,36 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", voice="Alice")
         assert speech_server._validate_tts_request(req) is not None
 
+    def test_precomputed_qwen3_icl_accepts_baked_speaker_anchor(self, speech_server, tmp_path):
+        """An offline ICL profile may anchor to a baked voice without speaker-encoder weights."""
+        from safetensors.torch import save_file
+
+        save_file({"ref_code": torch.ones((3, 16), dtype=torch.long)}, str(tmp_path / "maya.safetensors"))
+        _write_custom_voice_manifest(
+            tmp_path,
+            model_type="qwen3_tts",
+            voices={
+                "maya_warm": {
+                    "file": "maya.safetensors",
+                    "mode": "icl",
+                    "ref_text": "reference transcript",
+                    "speaker_anchor_voice": "maya_warm",
+                }
+            },
+        )
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                custom_voice_dir=str(tmp_path),
+                talker_config=SimpleNamespace(hidden_size=4),
+            )
+        )
+
+        profiles = speech_server._load_precomputed_speakers()
+
+        assert profiles["maya_warm"]["speaker_anchor_voice"] == "maya_warm"
+        assert profiles["maya_warm"]["ref_code_length"] == 3
+
     def test_precomputed_voxcpm2_missing_safetensors_is_not_registered(self, speech_server, tmp_path):
         """VoxCPM2 must not advertise a manifest-only voice that cannot hit prompt cache."""
         _write_custom_voice_manifest(

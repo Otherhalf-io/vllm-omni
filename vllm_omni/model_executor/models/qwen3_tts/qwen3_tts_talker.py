@@ -511,11 +511,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             if tensors is None:
                 continue
 
-            speaker_embedding = tensors["speaker_embedding"].reshape(-1).contiguous().cpu()
+            speaker_embedding = tensors.get("speaker_embedding")
+            if isinstance(speaker_embedding, torch.Tensor):
+                speaker_embedding = speaker_embedding.reshape(-1).contiguous().cpu()
             mode = str(profile.get("mode") or "xvec").lower()
             ref_code = tensors.get("ref_code")
             artifacts: dict[str, Any] = {
                 "ref_spk_embedding": speaker_embedding,
+                "speaker_anchor": {
+                    "kind": "voice",
+                    "voice": profile["speaker_anchor_voice"],
+                }
+                if profile.get("speaker_anchor_voice")
+                else None,
                 "ref_code": ref_code.contiguous().cpu() if isinstance(ref_code, torch.Tensor) else None,
                 "icl_mode": mode == "icl",
                 "ref_text": profile.get("ref_text"),
