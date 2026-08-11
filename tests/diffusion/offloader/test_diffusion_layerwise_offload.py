@@ -4,6 +4,7 @@ import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.helpers.env import DeviceMemoryMonitor
+from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -18,6 +19,19 @@ IMAGE_VIDEO_MODELS = {
 }
 
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+
+LAYERWISE_MODEL_CASES = [
+    pytest.param(
+        "stabilityai/stable-audio-open-1.0",
+        marks=[pytest.mark.full_model, pytest.mark.diffusion],
+        id="stable_audio",
+    ),
+    pytest.param(
+        "riverclouds/qwen_image_random",
+        marks=[pytest.mark.core_model, pytest.mark.diffusion],
+        id="qwen_image_random",
+    ),
+]
 
 AUDIO_MODEL_PARAMS = {
     "runner_params": {},
@@ -87,7 +101,8 @@ def run_inference(
     return peak, output
 
 
-@pytest.mark.parametrize("model_name", list(MODELS.keys()))
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"})
+@pytest.mark.parametrize("model_name", LAYERWISE_MODEL_CASES)
 def test_layerwise_offload_diffusion_model(model_name: str):
     """Test that layerwise offloading reduces GPU memory usage.
 
@@ -104,6 +119,14 @@ def test_layerwise_offload_diffusion_model(model_name: str):
         # Run with layerwise offloading (1 layer on device)
         layerwise_offload_peak_memory, output_offload = run_inference(model_name, layerwise_offload=True)
         cleanup_dist_env_and_memory()
+    except ValueError as exc:
+        # omni_snapshot_download wraps GatedRepoError in a ValueError; skip instead of failing.
+        if "Access to model" in str(exc) and "is restricted" in str(exc):
+            pytest.skip(
+                f"Skipping: gated HF repo {model_name!r} inaccessible "
+                f"({exc}). See docs/contributing/ci/hf_credentials.md."
+            )
+        pytest.fail(f"Inference failed: {exc}")
     except Exception:
         pytest.fail("Inference failed")
 

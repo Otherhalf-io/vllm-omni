@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -59,7 +59,7 @@ class DiffusionExecutor(ABC):
             raise ValueError(f"Unknown distributed executor backend: {distributed_executor_backend}")
         return executor_class
 
-    def __init__(self, od_config: OmniDiffusionConfig):
+    def __init__(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
         self._init_executor()
 
@@ -68,14 +68,20 @@ class DiffusionExecutor(ABC):
         """Initialize the executor (e.g., launch workers, setup IPC)."""
         pass
 
+    @property
     @abstractmethod
-    def add_req(self, requests: OmniDiffusionRequest) -> DiffusionOutput:
-        """Add requests to the execution queue."""
+    def is_dead(self) -> bool:
+        """Whether the executor is shut down or has failed fatally."""
         pass
 
     @abstractmethod
     def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute request-mode work from a scheduler output."""
+        pass
+
+    @abstractmethod
+    def execute_batch(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
+        """Execute request-mode work through the request-batch path."""
         pass
 
     @abstractmethod
@@ -100,6 +106,14 @@ class DiffusionExecutor(ABC):
     def check_health(self) -> None:
         """Check if the executor and workers are healthy."""
         pass
+
+    def register_failure_callback(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when the executor fatally fails.
+
+        Executors without a background failure monitor can keep the default
+        no-op implementation.
+        """
+        return None
 
     @abstractmethod
     def shutdown(self) -> None:

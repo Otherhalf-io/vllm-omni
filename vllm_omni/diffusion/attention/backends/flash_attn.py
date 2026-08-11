@@ -11,15 +11,18 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 
 logger = init_logger(__name__)
 
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
+    supports_piecewise_spans: bool = True
 
     @classmethod
     def supports_attention_mask(cls) -> bool:
@@ -39,6 +42,20 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionImpl(AttentionImpl):
+    # Per-platform FP8 KV quantization support.
+    # To enable FP8 on a new platform, add its OmniPlatformEnum value here
+    # and handle kv_cache_dtype in the corresponding forward_{platform}().
+    #
+    # TODO(quant-backend): The FP8 quant path currently lives inside
+    # FlashAttentionImpl gated by ``attn_metadata.extra["kv_cache_dtype"]``.
+    # Eventually extract it into a dedicated FlashAttentionQuantBackend so
+    # backend selection (not metadata) decides quant. Until then, model
+    # authors can opt a specific Attention layer out via
+    # ``Attention(disable_kv_quant=True)``.
+    _supported_kv_cache_dtypes = {
+        "npu": {"fp8"},
+    }
+
     def __init__(
         self,
         num_heads: int,
@@ -55,8 +72,19 @@ class FlashAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.qkv_layout = qkv_layout
+        cfg = get_current_diffusion_config_or_none()
+        self.fa_deterministic = bool(getattr(cfg, "fa_deterministic", False)) if cfg is not None else False
         if backend_kwargs:
             logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
+
+    def _warn_fa_deterministic_non_dense(self, path: str) -> None:
+        if not self.fa_deterministic:
+            return
+        logger.warning_once(
+            "fa_deterministic=True is ignored on the %s FlashAttention path; "
+            "only the dense flash_attn_func path passes deterministic=True.",
+            path,
+        )
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -66,6 +94,28 @@ class FlashAttentionImpl(AttentionImpl):
     @staticmethod
     def _flash_wrapper(q, k, v, *, attn_func, **kwargs):
         return FlashAttentionImpl._unwrap_flash_output(attn_func(q, k, v, **kwargs))
+
+    @staticmethod
+    def _flash_varlen_wrapper(q, k, v, *, attn_func, causal, softmax_scale, **kwargs):
+        """Call a varlen-only FlashAttention backend for a dense segment."""
+        del kwargs
+        batch_size, q_len = q.shape[:2]
+        k_len = k.shape[1]
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, k_len, dtype=torch.int32, device=q.device)
+        out = attn_func(
+            q=q.flatten(0, 1),
+            k=k.flatten(0, 1),
+            v=v.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=k_len,
+            causal=causal,
+            softmax_scale=softmax_scale,
+        )
+        out = FlashAttentionImpl._unwrap_flash_output(out)
+        return out.reshape(batch_size, q_len, *out.shape[1:])
 
     def _forward_varlen_masked(
         self,
@@ -103,6 +153,46 @@ class FlashAttentionImpl(AttentionImpl):
         out_unpad = self._unwrap_flash_output(out_unpad)
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
+    def _forward_varlen_packed(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        """Run FlashAttention directly on an already packed sequence.
+
+        Some diffusion transformers already maintain exact packed-document
+        boundaries. Reusing those boundaries avoids rebuilding boolean masks
+        and gathering/scattering Q/K/V in every attention layer.
+        """
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_varlen_func,
+        )
+
+        if flash_attn_varlen_func is None:
+            raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
+        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
+            raise ValueError("Packed variable-length attention currently requires batch size 1")
+
+        out = flash_attn_varlen_func(
+            q=query.flatten(0, 1),
+            k=key.flatten(0, 1),
+            v=value.flatten(0, 1),
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+        )
+        out = self._unwrap_flash_output(out)
+        return out.reshape_as(query)
+
     def _forward_varlen_dense(
         self,
         query: torch.Tensor,
@@ -122,7 +212,9 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         batch_size, q_len = query.size()[:2]
-        cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        k_len = key.size(1)
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * k_len, step=k_len, dtype=torch.int32, device=query.device)
         # b s ... -> (b s) ...
         query = query.flatten(0, 1)
         key = key.flatten(0, 1)
@@ -132,10 +224,10 @@ class FlashAttentionImpl(AttentionImpl):
             q=query,
             k=key,
             v=value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=q_len,
-            max_seqlen_k=q_len,
+            max_seqlen_k=k_len,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
         )
@@ -154,6 +246,7 @@ class FlashAttentionImpl(AttentionImpl):
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
             flash_attn_func,
+            flash_attn_varlen_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -165,14 +258,24 @@ class FlashAttentionImpl(AttentionImpl):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+        extra = attn_metadata.extra if attn_metadata is not None else {}
 
         # Try piecewise attention
         if full_attn_spans is not None:
+            self._warn_fa_deterministic_non_dense("piecewise")
             logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
-            attn_func = partial(
-                FlashAttentionImpl._flash_wrapper,
-                attn_func=flash_attn_func,
-            )
+            if flash_attn_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_wrapper,
+                    attn_func=flash_attn_func,
+                )
+            elif flash_attn_varlen_func is not None:
+                attn_func = partial(
+                    FlashAttentionImpl._flash_varlen_wrapper,
+                    attn_func=flash_attn_varlen_func,
+                )
+            else:
+                raise ImportError("Piecewise FlashAttention requires a dense or varlen FlashAttention function")
 
             return piecewise_attn(
                 query,
@@ -181,9 +284,28 @@ class FlashAttentionImpl(AttentionImpl):
                 full_attn_spans,
                 self.softmax_scale,
                 attn_func,
+                query_ranges=attn_metadata.query_ranges,
+            )
+
+        packed_keys = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
+        present_packed_keys = [key for key in packed_keys if key in extra]
+        if present_packed_keys:
+            if len(present_packed_keys) != len(packed_keys):
+                missing = sorted(set(packed_keys) - set(present_packed_keys))
+                raise ValueError(f"Incomplete packed FlashAttention metadata; missing {missing}")
+            self._warn_fa_deterministic_non_dense("packed-varlen")
+            return self._forward_varlen_packed(
+                query,
+                key,
+                value,
+                cu_seqlens_q=extra["cu_seqlens_q"],
+                cu_seqlens_k=extra["cu_seqlens_k"],
+                max_seqlen_q=extra["max_seqlen_q"],
+                max_seqlen_k=extra["max_seqlen_k"],
             )
 
         if attention_mask is not None and torch.any(~attention_mask):
+            self._warn_fa_deterministic_non_dense("masked-varlen")
             return self._forward_varlen_masked(
                 query,
                 key,
@@ -192,15 +314,16 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         if flash_attn_func is not None:
-            out = flash_attn_func(
-                query,
-                key,
-                value,
-                causal=self.causal,
-                softmax_scale=self.softmax_scale,
-            )
+            fa_kwargs = {
+                "causal": self.causal,
+                "softmax_scale": self.softmax_scale,
+            }
+            if self.fa_deterministic:
+                fa_kwargs["deterministic"] = True
+            out = flash_attn_func(query, key, value, **fa_kwargs)
             return self._unwrap_flash_output(out)
 
+        self._warn_fa_deterministic_non_dense("dense-varlen-fallback")
         return self._forward_varlen_dense(
             query,
             key,
@@ -250,6 +373,39 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
+
+        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
+        if kv_cache_dtype is not None:
+            return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        return self.forward_fa_npu(query, key, value, attn_metadata)
+
+    def forward_fa_quant_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
+
+        layout = self.qkv_layout or "BNSD"
+        # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).
+        out = fp8_rotate_quant_fa(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            layout=layout,
+            softmax_scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
+    def forward_fa_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
         try:
             from mindiesd import attention_forward
         except ImportError:
@@ -259,10 +415,16 @@ class FlashAttentionImpl(AttentionImpl):
                 "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
-
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+
+        # NPU aclnnFlashAttentionScore requires mask shape to be one of:
+        # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
+        # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S]
+        # So reuse SDPA's mask reshape logic: [B, S] -> [B, 1, Sq, Skv]
+        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask, mask_mode="full_qk")
+
         layout = self.qkv_layout or "BNSD"
-        output = attention_forward(
+        return attention_forward(
             query,
             key,
             value,
@@ -271,4 +433,3 @@ class FlashAttentionImpl(AttentionImpl):
             op_type="fused_attn_score",
             layout=layout,
         )
-        return output
