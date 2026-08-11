@@ -20,6 +20,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The release-provenance contract verifies ancestry from the pinned
+          # upstream base, so the contract job needs the complete commit graph.
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v5
 

@@ -1,6 +1,7 @@
 ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
 FROM ${BASE_IMAGE}
 
+ARG BASE_IMAGE
 ARG COMMON_WORKDIR=/app
 
 WORKDIR ${COMMON_WORKDIR}
@@ -16,7 +17,12 @@ RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 # Step 2: Copy vllm-omni code and install
 COPY . ${COMMON_WORKDIR}/vllm-omni
 ARG VLLM_OMNI_VERSION_OVERRIDE
+ARG VLLM_OMNI_SOURCE_SHA
+LABEL org.opencontainers.image.revision="${VLLM_OMNI_SOURCE_SHA}" \
+      org.opencontainers.image.version="${VLLM_OMNI_VERSION_OVERRIDE}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}"
 RUN test -n "${VLLM_OMNI_VERSION_OVERRIDE}" && \
+    test -n "${VLLM_OMNI_SOURCE_SHA}" && \
     cd ${COMMON_WORKDIR}/vllm-omni && \
     VLLM_OMNI_VERSION_OVERRIDE="${VLLM_OMNI_VERSION_OVERRIDE}" \
     uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."

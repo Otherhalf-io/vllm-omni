@@ -116,15 +116,28 @@ docker run --runtime nvidia --gpus 2 \
 #### Build docker image
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.cuda -t vllm-omni-cuda .
+DOCKER_BUILDKIT=1 docker build \
+  -f docker/Dockerfile.cuda \
+  --build-arg VLLM_OMNI_VERSION_OVERRIDE=0.26.1.dev76+g8e44e780.local \
+  --build-arg VLLM_OMNI_SOURCE_SHA=8e44e78038766b44832d6f9fd7000909517cd1cd \
+  -t vllm-omni-cuda .
 ```
+
+`VLLM_OMNI_VERSION_OVERRIDE` and `VLLM_OMNI_SOURCE_SHA` are required. The
+version must be a valid, source-specific PEP 440 version and the SHA is written
+to the image's OCI revision label. Production builds derive both from the
+repository-owned provenance in `.github/color-release.env` by running
+`.github/scripts/resolve_color_release.py`; they do not infer release identity from
+mutable tags.
 
 If you want to specify the base vLLM version:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build \
   -f docker/Dockerfile.cuda \
-  --build-arg BASE_IMAGE=vllm/vllm-openai:v0.26.0 \
+  --build-arg BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52 \
+  --build-arg VLLM_OMNI_VERSION_OVERRIDE=0.26.1.dev76+g8e44e780.local \
+  --build-arg VLLM_OMNI_SOURCE_SHA=8e44e78038766b44832d6f9fd7000909517cd1cd \
   -t vllm-omni-cuda .
 ```
 
