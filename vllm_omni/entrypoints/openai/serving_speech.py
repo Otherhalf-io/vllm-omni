@@ -58,6 +58,10 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.voice_resolution import (
+    resolve_custom_voice,
+    resolve_default_custom_voice,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
@@ -79,6 +83,10 @@ from vllm_omni.utils.speaker_cache import (
 )
 
 logger = init_logger(__name__)
+
+# Operator override for the CustomVoice fallback speaker. The stock default and
+# the resolution rules live in `tts_adapters.voice_resolution`.
+_DEFAULT_CUSTOM_VOICE_ENV = "VLLM_OMNI_TTS_DEFAULT_VOICE"
 
 
 _resolve_speech_request_id = resolve_speech_request_id
@@ -463,6 +471,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self.supported_speakers |= self._load_supported_speakers()
         self.supported_speakers |= set(self.precomputed_speakers)
 
+        # Resolved once so the validator and the request-params builder agree on
+        # a single default. None means "this model has no usable default", in
+        # which case CustomVoice requests must name a voice explicitly.
+        self.default_custom_voice = self._resolve_default_custom_voice()
+
         self.supported_languages = self._load_supported_languages()
 
         self._tts_tokenizer = None
@@ -744,6 +757,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # 3. Default fallback
         return _TTS_MAX_INSTRUCTIONS_LENGTH
+
+    def _resolve_default_custom_voice(self) -> str | None:
+        """Resolve this deployment's CustomVoice default speaker, or None.
+
+        Delegates the rules to ``tts_adapters.voice_resolution`` so the adapter's
+        request validation and this substitution cannot disagree.
+        """
+        default, problem = resolve_default_custom_voice(
+            self.supported_speakers,
+            configured=os.getenv(_DEFAULT_CUSTOM_VOICE_ENV),
+        )
+        if problem:
+            logger.warning("Qwen3-TTS CustomVoice: %s", problem)
+        return default
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -2451,6 +2478,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         else:
             params["task_type"] = ["CustomVoice"]
 
+        # Resolve CustomVoice at the point where the speaker parameter is
+        # built. Admission validation reports the same error earlier, but not
+        # every internal entrypoint is required to pass through the adapter's
+        # validate() method (notably batch item coercion).
+        if params["task_type"][0] == "CustomVoice":
+            effective_voice, voice_error = resolve_custom_voice(
+                request.voice,
+                self.default_custom_voice,
+                self.supported_speakers,
+            )
+            if voice_error is not None:
+                raise ValueError(voice_error)
+            request.voice = effective_voice
+
         # Language
         if request.language is not None:
             params["language"] = [request.language]
@@ -2506,9 +2547,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if mode == "icl" and ref_code_length:
                     params["ref_code_length"] = [int(ref_code_length)]
                 logger.info("Using precomputed Qwen3-TTS custom voice profile: %s (mode=%s)", voice_lower, mode)
-
-        elif params["task_type"][0] == "CustomVoice":
-            params["speaker"] = ["Vivian"]  # Default for CustomVoice
 
         # Instructions for style/emotion control
         if request.instructions is not None:

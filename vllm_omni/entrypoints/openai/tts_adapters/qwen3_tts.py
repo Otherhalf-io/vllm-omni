@@ -8,6 +8,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.entrypoints.openai.tts_adapters.voice_resolution import (
+    normalize_speaker,
+    resolve_custom_voice,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -34,11 +38,12 @@ class Qwen3TTSAdapter(ARTTSAdapter):
         if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
             request.task_type = "Base"
 
-        # Normalize voice to lowercase for case-insensitive matching
-        if request.voice is not None:
-            request.voice = request.voice.lower()
-            if request.task_type is None and request.voice in server.precomputed_speakers:
-                request.task_type = "Base"
+        # Canonicalize the caller's value before task inference or parameter
+        # building. Blank values become absent and may use the deployment's
+        # resolved CustomVoice default below.
+        request.voice = normalize_speaker(request.voice)
+        if request.voice is not None and request.task_type is None and request.voice in server.precomputed_speakers:
+            request.task_type = "Base"
         task_type = request.task_type or "CustomVoice"
 
         # Validate input is not empty
@@ -53,16 +58,22 @@ class Qwen3TTSAdapter(ARTTSAdapter):
                     f"Invalid language '{request.language}'. Supported: {', '.join(sorted(server.supported_languages))}"
                 )
 
-        # Validate speaker for CustomVoice task
+        # Validate speaker for CustomVoice task.
+        #
+        # The *effective* speaker is validated, not just the supplied one: when
+        # `voice` is omitted the server substitutes its default, and that
+        # substituted value used to reach the GPU worker unchecked -- where an
+        # unknown speaker raises inside preprocess and kills EngineCore for
+        # every session rather than failing this one request.
         if task_type == "CustomVoice":
-            if not server.supported_speakers:
-                return (
-                    "This model does not support CustomVoice task (no speakers configured). "
-                    "Use task_type='Base' with ref_audio/ref_text for voice cloning, "
-                    "or use a CustomVoice model."
-                )
-            if request.voice is not None and request.voice not in server.supported_speakers:
-                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(server.supported_speakers))}"
+            effective_voice, voice_error = resolve_custom_voice(
+                request.voice,
+                getattr(server, "default_custom_voice", None),
+                server.supported_speakers,
+            )
+            if voice_error is not None:
+                return voice_error
+            request.voice = effective_voice
 
         # Validate speaker_embedding constraints
         if request.speaker_embedding is not None:
