@@ -59,6 +59,7 @@ jobs:
             --no-project \
             --python 3.12 \
             --with pytest \
+            --with pytest-asyncio \
             --with pydantic \
             --with numpy \
             --with torch \
@@ -69,6 +70,7 @@ jobs:
             --no-project \
             --python 3.12 \
             --with pytest \
+            --with pytest-asyncio \
             --with pydantic \
             --with numpy \
             pytest -q --confcutdir=tests/entrypoints/openai_api --maxfail=1 \
