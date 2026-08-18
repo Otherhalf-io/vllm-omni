@@ -1,0 +1,109 @@
+name: Color Guard Tests
+
+# Runs on EVERY pull request, regardless of base branch.
+#
+# Why this file exists separately from upstream's workflows:
+#   * Upstream's `pre-commit.yml` and `build_wheel.yml` are gated on
+#     `pull_request: branches: [main]`. Stacked PRs target their parent
+#     branch, not main, so those workflows never fire inside a stack and
+#     stacked changes can merge with zero checks.
+#   * The former `ci.yml` did run these tests, but pinned an explicit file
+#     list (including `continuity.py`) that does not survive the upstream
+#     rebase.
+#
+# This workflow is deliberately Color-specific and file-list tolerant so it
+# keeps working on both sides of an upstream merge. Please do not delete it
+# when syncing upstream.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  color-guard:
+    name: Color TTS guard tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    env:
+      UV_NO_SYNC: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Lint changed Python files
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then
+            echo "no PR base (manual run); skipping lint"
+            exit 0
+          fi
+          git diff --name-only --diff-filter=d "$base"...HEAD -- '*.py' > changed.txt || true
+          if [ ! -s changed.txt ]; then
+            echo "no Python changes in this PR"
+            exit 0
+          fi
+          sed 's/^/  /' changed.txt
+          xargs -a changed.txt uv run --no-project --with ruff ruff check --
+          xargs -a changed.txt uv run --no-project --with ruff ruff format --check --
+
+      - name: Run Color TTS contract tests
+        run: |
+          set -euo pipefail
+          # Candidates spanning both the pre- and post-upstream layouts.
+          #
+          # Every entry must be importable with only the deps installed below.
+          # test_serving_speech.py is deliberately absent: it imports fastapi and
+          # the rest of the serving stack, so it belongs in a heavier job than
+          # this guard.
+          candidates=(
+            tests/entrypoints/openai_api/test_speech_request_id_contract.py
+            tests/entrypoints/openai_api/test_color_request_contract.py
+            tests/entrypoints/openai_api/test_custom_voice_default_contract.py
+            tests/entrypoints/openai_api/test_docker_build_contract.py
+            tests/model_executor/models/qwen3_tts/test_qwen3_tts_continuity.py
+          )
+          present=()
+          for f in "${candidates[@]}"; do
+            if [ -f "$f" ]; then present+=("$f"); else echo "skip missing $f"; fi
+          done
+          if [ ${#present[@]} -eq 0 ]; then
+            echo "::error::no Color contract tests found — the guard has lost its targets"
+            exit 1
+          fi
+          printf 'running:\n'; printf '  %s\n' "${present[@]}"
+
+          # One invocation per test directory, each with --confcutdir pinned to
+          # that directory. This is not cosmetic: without it pytest walks up to
+          # rootdir and loads tests/conftest.py, whose pytest_plugins import
+          # vLLM itself (tests/helpers/fixtures/env.py), which this light job
+          # cannot install. Grouping by directory is what lets the candidate
+          # list span trees while each run stays dependency-light.
+          #
+          # pytest-asyncio is required even though these tests are synchronous:
+          # pyproject.toml sets `asyncio_mode` under [tool.pytest.ini_options]
+          # together with `--strict-config` in addopts, so pytest aborts with
+          # "Unknown config option: asyncio_mode" when the plugin is missing.
+          for d in $(printf '%s\n' "${present[@]}" | xargs -n1 dirname | sort -u); do
+            files=()
+            for f in "${present[@]}"; do
+              if [ "$(dirname "$f")" = "$d" ]; then files+=("$f"); fi
+            done
+            echo "::group::pytest ${d}"
+            uv run \
+              --no-project \
+              --python 3.12 \
+              --with pytest \
+              --with pytest-asyncio \
+              --with pydantic \
+              --with numpy \
+              --with torch \
+              pytest -q --confcutdir="$d" --maxfail=1 -p no:cacheprovider "${files[@]}"
+            echo "::endgroup::"
+          done
