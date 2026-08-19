@@ -1,0 +1,58 @@
+name: Color contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  color-contracts:
+    name: Color TTS contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Compile Color-owned serving surfaces
+        run: |
+          set -euo pipefail
+          uv run --no-project --python 3.12 python -m py_compile \
+            vllm_omni/entrypoints/openai/protocol/audio.py \
+            vllm_omni/entrypoints/openai/serving_speech.py \
+            vllm_omni/entrypoints/openai/serving_speech_stream.py \
+            vllm_omni/model_executor/models/qwen3_tts/prompt_embeds_builder.py \
+            vllm_omni/model_executor/models/qwen3_tts/qwen3_tts_talker.py \
+            vllm_omni/utils/speaker_cache.py
+
+      - name: Run dependency-light contract tests
+        run: |
+          set -euo pipefail
+          tests=(tests/color_contracts/test_fork_contract.py)
+          for candidate in \
+            tests/color_contracts/test_request_contract.py \
+            tests/color_contracts/test_maya_profile_contract.py \
+            tests/color_contracts/test_docker_build_contract.py; do
+            if [[ -f "${candidate}" ]]; then
+              tests+=("${candidate}")
+            fi
+          done
+          uv run \
+            --no-project \
+            --python 3.12 \
+            --with pytest \
+            --with pydantic \
+            --with numpy \
+            --with torch \
+            --with safetensors \
+            pytest -q -c /dev/null -p no:cacheprovider \
+              --confcutdir=tests/color_contracts --maxfail=1 "${tests[@]}"
