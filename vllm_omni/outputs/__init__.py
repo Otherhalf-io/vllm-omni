@@ -36,6 +36,13 @@ class OmniConnectorOutput:
     has_pending_kv_work: bool = False
 
 
+@dataclass(frozen=True)
+class RequestPreprocessingError:
+    message: str
+    status_code: int
+    error_type: str
+
+
 @dataclass
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
@@ -57,6 +64,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    preprocessing_errors: dict[str, RequestPreprocessingError] = field(default_factory=dict)
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

@@ -663,3 +663,40 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+def test_preprocessing_error_becomes_typed_terminal_request_output(monkeypatch) -> None:
+    from vllm_omni.outputs import OmniRequestOutput
+
+    monkeypatch.setattr(
+        VLLMOutputProcessor,
+        "process_outputs",
+        lambda *_args, **_kwargs: SimpleNamespace(request_outputs=[], reqs_to_abort=[]),
+    )
+    processor = object.__new__(MultimodalOutputProcessor)
+    processor.output_modality = OutputModality.from_string("audio")
+    processor.request_states = {"bad": SimpleNamespace(queue=None)}
+    finished: list[str] = []
+    processor._finish_request = lambda state: finished.append("bad")
+
+    result = processor.process_outputs(
+        [
+            OmniEngineCoreOutput(
+                request_id="bad",
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                preprocessing_error="unsupported speaker",
+                error_status_code=400,
+                error_type="BadRequestError",
+            )
+        ]
+    )
+
+    assert finished == ["bad"]
+    assert len(result.request_outputs) == 1
+    output = result.request_outputs[0]
+    assert isinstance(output, OmniRequestOutput)
+    assert output.finished is True
+    assert output.error == "unsupported speaker"
+    assert output.error_status_code == 400
+    assert output.error_type == "BadRequestError"

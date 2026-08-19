@@ -87,3 +87,30 @@ jobs:
             pytest -q -c /dev/null -p no:cacheprovider \
               --confcutdir=tests/entrypoints/openai_api --maxfail=1 \
               tests/entrypoints/openai_api/test_custom_voice_point_of_use.py
+
+  request-input-isolation:
+    name: TTS request input isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Run integrated request-isolation regressions
+        env:
+          PYTHONPATH: .
+          UV_TORCH_BACKEND: cpu
+        run: |
+          set -euo pipefail
+          uv run \
+            --no-project \
+            --python 3.12 \
+            --with-requirements .github/requirements/color-serving-tests.txt \
+            pytest -q -c /dev/null -p no:cacheprovider \
+              --confcutdir=tests --maxfail=1 \
+              tests/worker/test_gpu_ar_model_runner.py::test_request_input_error_is_isolated_and_next_request_continues \
+              tests/worker/test_gpu_ar_model_runner.py::test_untyped_preprocessing_errors_remain_fatal \
+              tests/worker/test_gpu_ar_model_runner.py::test_qwen_prompt_builder_classifies_malformed_ref_audio \
+              tests/core/sched/test_omni_ar_scheduler_logprobs.py::test_preprocessing_error_frees_request_and_removes_it_from_running \
+              tests/engine/test_output_processor.py::test_preprocessing_error_becomes_typed_terminal_request_output

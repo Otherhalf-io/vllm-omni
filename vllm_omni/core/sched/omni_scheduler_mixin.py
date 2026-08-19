@@ -283,6 +283,9 @@ class OmniSchedulerMixin:
         num_nans_in_logits: int = 0,
         is_segment_finished: bool | None = False,
         new_prompt_len_snapshot: int | None = None,
+        preprocessing_error: str | None = None,
+        error_status_code: int | None = None,
+        error_type: str | None = None,
     ) -> OmniEngineCoreOutput:
         """Build the common request-output envelope used by LLM schedulers."""
         return OmniEngineCoreOutput(
@@ -302,6 +305,9 @@ class OmniSchedulerMixin:
             num_nans_in_logits=num_nans_in_logits,
             is_segment_finished=is_segment_finished,
             new_prompt_len_snapshot=new_prompt_len_snapshot,
+            preprocessing_error=preprocessing_error,
+            error_status_code=error_status_code,
+            error_type=error_type,
         )
 
     def _append_request_output(

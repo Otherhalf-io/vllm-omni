@@ -334,6 +334,32 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # in pipeline parallelism or async scheduling).
                 continue
 
+            preprocessing_error = getattr(model_runner_output, "preprocessing_errors", {}).get(req_id)
+            if preprocessing_error is not None:
+                status_before_stop = request.status
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = preprocessing_error.message
+                request.resumable = False
+                finish_reason = request.get_finished_reason()
+                kv_transfer_params, _ = self._free_request(request)
+                if status_before_stop == RequestStatus.RUNNING:
+                    stopped_running_reqs.add(request)
+                else:
+                    stopped_preempted_reqs.add(request)
+                OmniSchedulerMixin._append_request_output(
+                    self,
+                    outputs,
+                    request,
+                    new_token_ids=[],
+                    finish_reason=finish_reason,
+                    stop_reason=preprocessing_error.message,
+                    kv_transfer_params=kv_transfer_params,
+                    preprocessing_error=preprocessing_error.message,
+                    error_status_code=preprocessing_error.status_code,
+                    error_type=preprocessing_error.error_type,
+                )
+                continue
+
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
             status_before_stop = request.status

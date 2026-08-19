@@ -45,7 +45,8 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
     get_stage_connector_role,
     stage_sends_async_output,
 )
-from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.errors import RequestInputError
+from vllm_omni.outputs import OmniModelRunnerOutput, RequestPreprocessingError
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -445,6 +446,32 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if helper is not None:
             helper.update_states(self, scheduler_output)
         return deferred_state_corrections_fn
+
+    def _preprocess_request_isolated(
+        self,
+        *,
+        req_id: str,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        req_infos: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        try:
+            return super()._preprocess_request_isolated(
+                req_id=req_id,
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+                req_infos=req_infos,
+            )
+        except RequestInputError as exc:
+            self._request_preprocessing_errors[req_id] = RequestPreprocessingError(
+                message=exc.message,
+                status_code=exc.status_code,
+                error_type=exc.error_type,
+            )
+            fallback_embeds = input_embeds
+            if fallback_embeds is None:
+                fallback_embeds = self.model.embed_input_ids(input_ids=input_ids)
+            return input_ids, fallback_embeds, {}
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -998,6 +1025,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+        self._request_preprocessing_errors: dict[str, RequestPreprocessingError] = {}
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -1865,6 +1893,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
+        preprocessing_errors: dict[str, RequestPreprocessingError] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -2022,6 +2051,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             with record_function_or_nullcontext("omni_output_builder:get_omni_connector_output"):
                 output.omni_connector_output = self.get_omni_connector_output()
             output.routed_experts = routed_experts_lists
+            output.preprocessing_errors = dict(preprocessing_errors or {})
         return output
 
     @torch.inference_mode()
@@ -2205,6 +2235,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_nans_in_logits_snapshot = (
             dict(num_nans_in_logits) if isinstance(num_nans_in_logits, dict) else num_nans_in_logits
         )
+        preprocessing_errors_snapshot = dict(self._request_preprocessing_errors)
 
         use_async_omni_output = self._should_use_async_omni_output()
         omni_postprocess_already_applied = False
@@ -2247,6 +2278,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    preprocessing_errors=preprocessing_errors_snapshot,
                 )
 
         if not use_async_omni_output:

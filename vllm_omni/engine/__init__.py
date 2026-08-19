@@ -133,6 +133,9 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     is_segment_finished: bool | None = False
     # Streaming update prompt length
     new_prompt_len_snapshot: int | None = None
+    preprocessing_error: str | None = None
+    error_status_code: int | None = None
+    error_type: str | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):
