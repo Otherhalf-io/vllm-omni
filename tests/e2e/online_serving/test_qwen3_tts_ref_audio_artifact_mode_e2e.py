@@ -64,6 +64,7 @@ def test_xvector_then_icl_same_ref_audio_keeps_engine_alive(omni_server, openai_
     """
     base_request = {
         "model": omni_server.model,
+        "request_id": "e2e-qwen3-ref-artifact",
         "input": INPUT_TEXT,
         "stream": False,
         "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
@@ -76,13 +77,24 @@ def test_xvector_then_icl_same_ref_audio_keeps_engine_alive(omni_server, openai_
 
     # 1) x-vector-only request: caches a speaker embedding (no ref_code) and, on
     #    completion, marks the ref_audio artifact "ready".
-    openai_client.send_audio_speech_request({**base_request, "x_vector_only_mode": True})
+    openai_client.send_audio_speech_request(
+        {**base_request, "request_id": "e2e-qwen3-ref-artifact-xvec-1", "x_vector_only_mode": True}
+    )
 
     # 2) ICL request with the SAME ref_audio. Pre-fix this reused the x-vector
     #    artifact via the artifact-only path, hit the missing ref_code, and
     #    killed EngineCore (#5049). It must now succeed with audio.
-    openai_client.send_audio_speech_request({**base_request, "x_vector_only_mode": False, "ref_text": REF_TEXT})
+    openai_client.send_audio_speech_request(
+        {
+            **base_request,
+            "request_id": "e2e-qwen3-ref-artifact-icl",
+            "x_vector_only_mode": False,
+            "ref_text": REF_TEXT,
+        }
+    )
 
     # 3) The server must still be serving after the ICL request (pre-fix this
     #    would fail with EngineDeadError / connection refused).
-    openai_client.send_audio_speech_request({**base_request, "x_vector_only_mode": True})
+    openai_client.send_audio_speech_request(
+        {**base_request, "request_id": "e2e-qwen3-ref-artifact-xvec-2", "x_vector_only_mode": True}
+    )

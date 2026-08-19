@@ -82,6 +82,7 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
     """
     request_config = {
         "input": get_prompt(),
+        "request_id": "e2e-offline-qwen3-base",
         "task_type": "Base",
         "voice": "clone",
         "ref_audio": REF_AUDIO_URL,
