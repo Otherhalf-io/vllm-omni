@@ -46,7 +46,7 @@ jobs:
               tests+=("${candidate}")
             fi
           done
-          uv run \
+          PYTHONPATH=. uv run \
             --no-project \
             --python 3.12 \
             --with pytest \

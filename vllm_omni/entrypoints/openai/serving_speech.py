@@ -30,7 +30,6 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
-from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
@@ -45,6 +44,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItemResult,
     SpeechInputTokenDetails,
     SpeechTokenUsage,
+    resolve_speech_request_id,
 )
 from vllm_omni.entrypoints.openai.speech_usage import (
     SpeechOutputTokenCounter,
@@ -79,6 +79,10 @@ from vllm_omni.utils.speaker_cache import (
 )
 
 logger = init_logger(__name__)
+
+
+_resolve_speech_request_id = resolve_speech_request_id
+
 
 # TTS Configuration
 #
@@ -2176,6 +2180,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_start_s: float | None = None,
         include_sample_rate: bool = False,
         usage_acc: SpeechOutputTokenCounter | None = None,
+        session_id: str | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2280,22 +2285,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if first_audio_chunk_s is not None:
                 first_chunk_ms = (first_audio_chunk_s - stream_start_s) * 1000.0
                 logger.info(
-                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
+                    "[SpeechE2E] request_id=%s session_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=%.2f",
                     request_id,
+                    session_id or "-",
                     total_ms,
                     first_chunk_ms,
                 )
             else:
                 logger.info(
-                    "[SpeechE2E] request_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
+                    "[SpeechE2E] request_id=%s session_id=%s stream=true status=ok total_ms=%.2f first_chunk_ms=NA",
                     request_id,
+                    session_id or "-",
                     total_ms,
                 )
         except asyncio.CancelledError:
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             logger.info(
-                "[SpeechE2E] request_id=%s stream=true status=cancelled total_ms=%.2f",
+                "[SpeechE2E] request_id=%s session_id=%s stream=true status=cancelled total_ms=%.2f",
                 request_id,
+                session_id or "-",
                 total_ms,
             )
             logger.info("Streaming request %s cancelled by client", request_id)
@@ -2303,8 +2311,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except EngineDeadError as e:
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             logger.error(
-                "[SpeechE2E] request_id=%s stream=true status=engine_dead total_ms=%.2f",
+                "[SpeechE2E] request_id=%s session_id=%s stream=true status=engine_dead total_ms=%.2f",
                 request_id,
+                session_id or "-",
                 total_ms,
             )
             logger.error(
@@ -2322,8 +2331,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             total_ms = (time.perf_counter() - stream_start_s) * 1000.0
             logger.exception(
-                "[SpeechE2E] request_id=%s stream=true status=error total_ms=%.2f error=%s",
+                "[SpeechE2E] request_id=%s session_id=%s stream=true status=error total_ms=%.2f error=%s",
                 request_id,
+                session_id or "-",
                 total_ms,
                 e,
             )
@@ -2366,6 +2376,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raw_request=raw_request,
                 request_start_s=request_start_s,
                 usage_acc=usage_acc,
+                session_id=request.session_id if request is not None else None,
             ):
                 payload = {
                     "type": "speech.audio.delta",
@@ -3106,7 +3117,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        request_id = request_id or f"speech-{random_uuid()}"
+        request_id = _resolve_speech_request_id(request, request_id)
         qwen3_ref_audio_warmup_artifact_key: str | None = None
 
         # If this is a streaming request with real async chunks, we need to
@@ -3335,7 +3346,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         return request_id, generator, tts_params
 
-    async def _generate_pcm_chunks(self, generator, request_id: str, *, include_sample_rate: bool = False):
+    async def _generate_pcm_chunks(
+        self,
+        generator,
+        request_id: str,
+        *,
+        include_sample_rate: bool = False,
+        session_id: str | None = None,
+    ):
         """Yield raw PCM byte chunks from the engine generator.
 
         Delegates to ``_generate_audio_chunks`` with ``response_format="pcm"``.
@@ -3346,6 +3364,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request_id,
             response_format="pcm",
             include_sample_rate=include_sample_rate,
+            session_id=session_id,
         ):
             yield chunk
 
@@ -3353,7 +3372,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
         try:
-            async for chunk in self._generate_pcm_chunks(generator, request_id):
+            async for chunk in self._generate_pcm_chunks(generator, request_id, session_id=request.session_id):
                 yield chunk
         finally:
             self._discard_ref_audio_artifact_warmup(request_id)
@@ -3489,6 +3508,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _create_diffusion_speech(
         self,
         request: OpenAICreateSpeechRequest,
+        request_id: str | None = None,
     ) -> Response:
         """Handle speech generation for pure diffusion TTS models (e.g. OmniVoice)."""
         from vllm_omni.outputs import OmniRequestOutput
@@ -3513,7 +3533,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if err:
                 raise ValueError(err)
 
-            request_id = f"speech-{random_uuid()}"
+            request_id = _resolve_speech_request_id(request, request_id)
             prompt: dict[str, Any] = {"input": request.input}
             if request.ref_audio:
                 wav, sr = await self._resolve_ref_audio(request.ref_audio)
@@ -3531,8 +3551,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["instruct"] = request.instructions
 
             logger.info(
-                "Diffusion TTS speech request %s: text=%r, voice_clone=%s",
+                "Diffusion TTS speech request %s: session_id=%s text=%r, voice_clone=%s",
                 request_id,
+                request.session_id or "-",
                 request.input[:50] + "..." if len(request.input) > 50 else request.input,
                 "ref_audio" in prompt,
             )
@@ -3663,22 +3684,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Raw audio streaming yields each Code2Wav chunk as raw bytes as soon as it is
         decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
-        if self._diffusion_mode:
-            return await self._create_diffusion_speech(request)
-
-        error_check_ret = await self._check_model(request)
-        if error_check_ret is not None:
-            logger.error("Error with model %s", error_check_ret)
-            return error_check_ret
-
-        request_id = f"speech-{random_uuid()}"
+        request_id = request.request_id
         request_start_s = time.perf_counter()
-        if raw_request:
-            raw_request.state.request_metadata = RequestResponseMetadata(
-                request_id=request_id,
-            )
 
         try:
+            request_id = _resolve_speech_request_id(request)
+            if raw_request:
+                raw_request.state.request_metadata = RequestResponseMetadata(
+                    request_id=request_id,
+                )
+            if self._diffusion_mode:
+                return await self._create_diffusion_speech(
+                    request,
+                    request_id=request_id,
+                )
+
+            error_check_ret = await self._check_model(request)
+            if error_check_ret is not None:
+                logger.error("Error with model %s", error_check_ret)
+                return error_check_ret
+
             if request.is_streaming() and request.word_timestamps:
                 return self.create_error_response(
                     "word_timestamps=true is currently supported by the WebSocket "
@@ -3703,6 +3728,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         response_format,
                         raw_request=raw_request,
                         request_start_s=request_start_s,
+                        session_id=request.session_id,
                     ),
                     media_type=media_type,
                 )
@@ -3732,8 +3758,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
-                "[SpeechE2E] request_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
+                "[SpeechE2E] request_id=%s session_id=%s stream=false status=ok total_ms=%.2f response_bytes=%d",
                 request_id,
+                request.session_id or "-",
                 total_ms,
                 len(audio_bytes) if isinstance(audio_bytes, (bytes, bytearray)) else len(str(audio_bytes)),
             )
@@ -3742,8 +3769,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except asyncio.CancelledError:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.info(
-                "[SpeechE2E] request_id=%s stream=%s status=cancelled total_ms=%.2f",
+                "[SpeechE2E] request_id=%s session_id=%s stream=%s status=cancelled total_ms=%.2f",
                 request_id,
+                request.session_id or "-",
                 bool(request.stream),
                 total_ms,
             )
@@ -3751,8 +3779,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except (EngineGenerateError, EngineDeadError):
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.error(
-                "[SpeechE2E] request_id=%s stream=%s status=engine_error total_ms=%.2f",
+                "[SpeechE2E] request_id=%s session_id=%s stream=%s status=engine_error total_ms=%.2f",
                 request_id,
+                request.session_id or "-",
                 bool(request.stream),
                 total_ms,
             )
@@ -3760,8 +3789,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except ValueError as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.warning(
-                "[SpeechE2E] request_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",
+                "[SpeechE2E] request_id=%s session_id=%s stream=%s status=bad_request total_ms=%.2f error=%s",
                 request_id,
+                request.session_id or "-",
                 bool(request.stream),
                 total_ms,
                 e,
@@ -3770,8 +3800,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             total_ms = (time.perf_counter() - request_start_s) * 1000.0
             logger.exception(
-                "[SpeechE2E] request_id=%s stream=%s status=error total_ms=%.2f error=%s",
+                "[SpeechE2E] request_id=%s session_id=%s stream=%s status=error total_ms=%.2f error=%s",
                 request_id,
+                request.session_id or "-",
                 bool(request.stream),
                 total_ms,
                 e,
@@ -3794,6 +3825,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         picked_speed = _pick("speed")
         return OpenAICreateSpeechRequest(
             input=item.input,
+            session_id=batch.session_id,
             model=batch.model,
             voice=_pick("voice"),
             instructions=_pick("instructions"),
@@ -3829,11 +3861,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        batch_id = f"speech-batch-{random_uuid()}"
+        batch_id = batch_request.request_id
 
         merged_requests = [self._merge_batch_item(batch_request, item) for item in batch_request.items]
 
         async def _run_item(idx: int, req: OpenAICreateSpeechRequest) -> SpeechBatchItemResult:
+            req.request_id = f"{batch_id}-{idx}"
             has_inline_ref_audio = req.ref_audio is not None
             validation_error = self._validate_tts_request(req)
             if validation_error is not None:
@@ -3841,10 +3874,24 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             usage_box: list[SpeechTokenUsage] = []
             try:
                 audio_data, media_type = await self._generate_audio_bytes(
-                    req, base64_encode=True, usage_out=usage_box, has_inline_ref_audio=has_inline_ref_audio
+                    req,
+                    base64_encode=True,
+                    usage_out=usage_box,
+                    has_inline_ref_audio=has_inline_ref_audio,
+                )
+                logger.info(
+                    "[SpeechE2E] request_id=%s session_id=%s stream=false batch=true status=ok",
+                    req.request_id,
+                    req.session_id or "-",
                 )
             except Exception as e:
-                logger.exception("Batch item %d failed: %s", idx, e)
+                logger.exception(
+                    "Batch item %d failed: request_id=%s session_id=%s error=%s",
+                    idx,
+                    req.request_id,
+                    req.session_id or "-",
+                    e,
+                )
                 return SpeechBatchItemResult(index=idx, status="error", error=str(e))
             return SpeechBatchItemResult(
                 index=idx,

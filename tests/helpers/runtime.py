@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Generator
 from dataclasses import asdict, dataclass
 from io import BytesIO
@@ -2072,6 +2073,9 @@ class OpenAIClientHandler:
             is used (no try/except around ``APIError``).
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
+          - request_id: optional caller-owned prefix; the maintained test client
+            creates one when omitted and derives a unique id per concurrent request
+          - session_id: optional caller-owned correlation id
         """
         timeout = float(request_config.get("timeout", 120.0))
 
@@ -2085,6 +2089,8 @@ class OpenAIClientHandler:
 
         # Qwen3-TTS custom fields, forwarded via extra_body.
         extra_body: dict[str, Any] = {}
+        request_id_prefix = request_config.get("request_id") or f"test-audio-speech-{uuid.uuid4().hex}"
+        session_id = request_config.get("session_id")
         # Keep this list aligned with vllm_omni.entrypoints.openai.protocol.audio params.
         for key in (
             "task_type",
@@ -2100,6 +2106,13 @@ class OpenAIClientHandler:
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]
+
+        def _extra_body_for(request_idx: int) -> dict[str, Any]:
+            body = dict(extra_body)
+            body["request_id"] = request_id_prefix if request_num == 1 else f"{request_id_prefix}-{request_idx}"
+            if session_id is not None:
+                body["session_id"] = session_id
+            return body
 
         responses: list[OmniResponse] = []
 
@@ -2127,7 +2140,7 @@ class OpenAIClientHandler:
                             model=model,
                             input=text_input,
                             response_format=response_format,
-                            extra_body=extra_body or None,
+                            extra_body=_extra_body_for(1),
                             timeout=timeout,
                             voice=voice,
                         ) as resp:
@@ -2140,7 +2153,7 @@ class OpenAIClientHandler:
                             model=model,
                             input=text_input,
                             response_format=response_format,
-                            extra_body=extra_body or None,
+                            extra_body=_extra_body_for(1),
                             timeout=timeout,
                             voice=voice,
                         )
@@ -2166,7 +2179,7 @@ class OpenAIClientHandler:
                     model=model,
                     input=text_input,
                     response_format=response_format,
-                    extra_body=extra_body or None,
+                    extra_body=_extra_body_for(1),
                     timeout=timeout,
                     voice=voice,
                 ) as resp:
@@ -2180,7 +2193,7 @@ class OpenAIClientHandler:
                     model=model,
                     input=text_input,
                     response_format=response_format,
-                    extra_body=extra_body or None,
+                    extra_body=_extra_body_for(1),
                     timeout=timeout,
                     voice=voice,
                 )
@@ -2206,7 +2219,7 @@ class OpenAIClientHandler:
                         model=model,
                         input=text_input,
                         response_format=response_format,
-                        extra_body=extra_body or None,
+                        extra_body=_extra_body_for(request_idx),
                         timeout=timeout,
                         voice=voice,
                     ) as resp:
@@ -2243,7 +2256,7 @@ class OpenAIClientHandler:
                         model=model,
                         input=text_input,
                         response_format=response_format,
-                        extra_body=extra_body or None,
+                        extra_body=_extra_body_for(request_idx),
                         timeout=timeout,
                         voice=voice,
                     )

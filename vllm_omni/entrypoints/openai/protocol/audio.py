@@ -2,13 +2,35 @@ import math
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _MAX_EMBEDDING_DIM = 8192
 
 SUPPORTED_AUDIO_FORMATS: frozenset[str] = frozenset({"wav", "pcm", "flac", "mp3", "opus"})
 SUPPORTED_CHAT_AUDIO_FORMATS: frozenset[str] = SUPPORTED_AUDIO_FORMATS | {"pcm16"}
 DEFAULT_AUDIO_FORMAT: str = "wav"
+
+
+def normalize_caller_identifier(value: str | None, *, field_name: str) -> str | None:
+    """Normalize a caller-owned correlation identifier without inventing one."""
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} must not be blank")
+    return normalized
+
+
+def resolve_speech_request_id(
+    request: "OpenAICreateSpeechRequest",
+    request_id: str | None = None,
+) -> str:
+    """Resolve a speech request id and fail if neither caller boundary supplied it."""
+    resolved = request_id if request_id is not None else request.request_id
+    resolved = normalize_caller_identifier(resolved, field_name="request_id")
+    if resolved is None:
+        raise ValueError("request_id must be a non-empty string for speech requests")
+    return resolved
 
 
 def _normalize_ref_audio_value(value):
@@ -50,6 +72,18 @@ def _normalize_speaker_embedding_value(value):
 
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
+    request_id: str | None = Field(
+        default=None,
+        description=(
+            "Caller-provided request id used as the engine request id. "
+            "Required by the external speech endpoint; internal transports "
+            "must pass their own explicit request id to the serving layer."
+        ),
+    )
+    session_id: str | None = Field(
+        default=None,
+        description="Optional caller-provided session id for request correlation.",
+    )
     model: str | None = None
     # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
     # convention) as input keys.  Intentionally global — all TTS backends
@@ -157,6 +191,12 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
+
+    @field_validator("request_id", "session_id")
+    @classmethod
+    def validate_caller_identifier(cls, value: str | None, info) -> str | None:
+        return normalize_caller_identifier(value, field_name=info.field_name)
+
     word_timestamps: bool = Field(
         default=False,
         description=(
@@ -392,6 +432,8 @@ class SpeechBatchItem(BaseModel):
     """Per-item input for batch speech. Only `input` is required;
     all other fields override the batch-level defaults when set."""
 
+    model_config = ConfigDict(extra="forbid")
+
     input: str
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
@@ -411,6 +453,10 @@ class BatchSpeechRequest(BaseModel):
     """Top-level request for batch speech generation.
     Fields here act as shared defaults; per-item overrides win."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(description="Caller-provided id used as the batch and engine request-id prefix.")
+    session_id: str | None = Field(default=None, description="Optional caller-provided correlation-only session id.")
     model: str | None = None
     items: list[SpeechBatchItem] = Field(..., min_length=1)
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
@@ -425,6 +471,11 @@ class BatchSpeechRequest(BaseModel):
     max_new_tokens: int | None = None
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0)
     non_streaming_mode: bool | None = None
+
+    @field_validator("request_id", "session_id")
+    @classmethod
+    def validate_caller_identifier(cls, value: str | None, info) -> str | None:
+        return normalize_caller_identifier(value, field_name=info.field_name)
 
 
 class SpeechInputTokenDetails(BaseModel):
@@ -499,6 +550,8 @@ class BatchSpeechResponse(BaseModel):
 class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
+    request_id: str = Field(description="Caller-provided request-id prefix for every utterance in this socket.")
+    session_id: str | None = Field(default=None, description="Optional caller-provided correlation-only session id.")
     model: str | None = None
     voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
@@ -544,6 +597,11 @@ class StreamingSpeechSessionConfig(BaseModel):
             "frames (existing behavior)."
         ),
     )
+
+    @field_validator("request_id", "session_id")
+    @classmethod
+    def validate_caller_identifier(cls, value: str | None, info) -> str | None:
+        return normalize_caller_identifier(value, field_name=info.field_name)
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "StreamingSpeechSessionConfig":

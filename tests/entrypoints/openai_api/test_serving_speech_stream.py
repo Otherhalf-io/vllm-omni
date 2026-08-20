@@ -30,7 +30,7 @@ def _build_test_app(
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-1", object(), {}))
         speech_service.forced_aligner_config = None
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, session_id=None):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield (chunk, 24000) if include_sample_rate else chunk
 
@@ -58,7 +58,14 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "request_id": "test-ws-single",
+                        "session_id": "session-ws",
+                        "voice": "Vivian",
+                    }
+                )
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
                 ws.send_json({"type": "input.done"})
 
@@ -67,6 +74,7 @@ class TestStreamingSpeechWebSocket:
                 assert start["sentence_index"] == 0
                 assert start["sentence_text"] == "Hello world."
                 assert start["format"] == "wav"
+                assert start["request_id"] == "test-ws-single-0-0"
 
                 audio = ws.receive_bytes()
                 assert audio.startswith(b"RIFF")
@@ -84,13 +92,16 @@ class TestStreamingSpeechWebSocket:
                 assert session_done == {"type": "session.done", "utterance_index": 0, "total_sentences": 1}
 
         assert speech_service._generate_audio_bytes.await_count == 1
+        request_id = speech_service._generate_audio_bytes.await_args.args[0].request_id
+        assert request_id == "test-ws-single-0-0"
+        assert speech_service._generate_audio_bytes.await_args.args[0].session_id == "session-ws"
 
     def test_input_done_flushes_and_keeps_connection_open(self, mocker: MockerFixture):
         app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-reuse", "voice": "Vivian"})
 
                 # The same connection serves several utterances; the config sent
                 # once at the top keeps applying and utterance_index rises.
@@ -115,6 +126,8 @@ class TestStreamingSpeechWebSocket:
             "Vivian",
             "Vivian",
         ]
+        request_ids = [call.args[0].request_id for call in speech_service._generate_audio_bytes.await_args_list]
+        assert request_ids == ["test-ws-reuse-0-0", "test-ws-reuse-1-0"]
 
     def test_sentence_index_stays_within_the_flushed_utterance(self, mocker: MockerFixture):
         # sentence_index counts within one flush and utterance_index counts the
@@ -123,7 +136,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-index", "voice": "Vivian"})
 
                 for expected_index in range(3):
                     ws.send_json({"type": "input.text", "text": "Hello world. "})
@@ -149,7 +162,9 @@ class TestStreamingSpeechWebSocket:
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
                 for expected_index, voice in enumerate(("Vivian", "Serena")):
-                    ws.send_json({"type": "session.config", "voice": voice})
+                    ws.send_json(
+                        {"type": "session.config", "request_id": f"test-ws-config-{expected_index}", "voice": voice}
+                    )
                     ws.send_json({"type": "input.text", "text": "Hello world. "})
                     ws.send_json({"type": "input.done"})
 
@@ -172,9 +187,9 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-buffered", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
-                ws.send_json({"type": "session.config", "voice": "Serena"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-rejected", "voice": "Serena"})
 
                 error = ws.receive_json()
                 assert error["type"] == "error"
@@ -194,7 +209,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-close", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
                 ws.send_json({"type": "input.done"})
 
@@ -212,7 +227,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-timeout", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
                 ws.send_json({"type": "input.done"})
 
@@ -243,7 +258,7 @@ class TestStreamingSpeechWebSocket:
 
         speech_service._prepare_speech_generation = mock_prepare_speech_generation
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, session_id=None):
             for chunk in (b"\x01\x02", b"\x03\x04\x05", b"\x06"):
                 yield (chunk, 24000) if include_sample_rate else chunk
 
@@ -255,6 +270,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
+                        "request_id": "test-ws-streaming",
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
@@ -298,6 +314,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
+                        "request_id": "test-ws-no-aligner",
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
@@ -328,7 +345,7 @@ class TestStreamingSpeechWebSocket:
         first_chunk = b"\x01" * 1000
         second_chunk = b"\x02" * 1000
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, session_id=None):
             for chunk in (first_chunk, second_chunk):
                 yield (chunk, 1000) if include_sample_rate else chunk
 
@@ -348,6 +365,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
+                        "request_id": "test-ws-sidecar",
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
@@ -418,7 +436,7 @@ class TestStreamingSpeechWebSocket:
         speech_service.forced_aligner_config = SimpleNamespace(model="aligner")
         speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req", object(), {}))
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, session_id=None):
             chunk = b"\x01" * 1000
             yield (chunk, 1000) if include_sample_rate else chunk
 
@@ -437,6 +455,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
+                        "request_id": "test-ws-word-dicts",
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
@@ -464,7 +483,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-flush", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world without punctuation"})
                 ws.send_json({"type": "input.done"})
 
@@ -487,6 +506,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
+                        "request_id": "test-ws-invalid-config",
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "wav",
@@ -501,7 +521,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-empty", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": ""})
                 ws.send_json({"type": "input.done"})
 
@@ -514,7 +534,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-multiple", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "First sentence. "})
                 ws.send_json({"type": "input.text", "text": "Second sentence. "})
                 ws.send_json({"type": "input.done"})
@@ -537,7 +557,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-unknown", "voice": "Vivian"})
                 ws.send_json({"type": "unknown"})
 
                 error = ws.receive_json()
@@ -577,7 +597,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-error", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "Hello world. "})
                 ws.send_json({"type": "input.done"})
 
@@ -604,7 +624,7 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_config = None
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, session_id=None):
             yield b"\x01\x02"
             raise RuntimeError("stream boom")
 
@@ -616,6 +636,7 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json(
                     {
                         "type": "session.config",
+                        "request_id": "test-ws-stream-error",
                         "voice": "Vivian",
                         "stream_audio": True,
                         "response_format": "pcm",
@@ -645,7 +666,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-invalid-text", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": 123})
 
                 assert ws.receive_json() == {
@@ -664,7 +685,7 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian"})
+                ws.send_json({"type": "session.config", "request_id": "test-ws-large-text", "voice": "Vivian"})
                 ws.send_json({"type": "input.text", "text": "x" * 128})
 
                 assert ws.receive_json() == {
@@ -683,7 +704,14 @@ class TestStreamingSpeechWebSocket:
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
-                ws.send_json({"type": "session.config", "voice": "Vivian", "ref_audio": "x" * 512})
+                ws.send_json(
+                    {
+                        "type": "session.config",
+                        "request_id": "test-ws-large-config",
+                        "voice": "Vivian",
+                        "ref_audio": "x" * 512,
+                    }
+                )
 
                 assert ws.receive_json() == {
                     "type": "error",
@@ -698,7 +726,7 @@ class TestStreamingSpeechWebSocket:
         speech_service.engine_client.abort = mocker.AsyncMock()
         speech_service.forced_aligner_config = None
 
-        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False):
+        async def mock_generate_pcm_chunks(_generator, _request_id, *, include_sample_rate=False, session_id=None):
             yield b"\x01\x02"
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
@@ -709,6 +737,8 @@ class TestStreamingSpeechWebSocket:
         websocket.send_bytes = mocker.AsyncMock(side_effect=WebSocketDisconnect())
 
         config = mocker.MagicMock()
+        config.request_id = "test-ws-disconnect"
+        config.session_id = "session-ws-disconnect"
         config.model = None
         config.voice = "Vivian"
         config.task_type = None
@@ -718,6 +748,7 @@ class TestStreamingSpeechWebSocket:
         config.speed = 1.0
         config.max_new_tokens = None
         config.initial_codec_chunk_frames = None
+        config.non_streaming_mode = None
         config.ref_audio = None
         config.ref_text = None
         config.x_vector_only_mode = None
