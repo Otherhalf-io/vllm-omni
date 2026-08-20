@@ -653,6 +653,67 @@ def test_voice_clone_prompt_artifacts_do_not_resolve_ref_audio_for_cache_fill():
     assert torch.equal(out_ref_code, ref_code)
 
 
+def test_anchored_icl_profile_uses_the_declared_voice_embedding():
+    builder = _make_minimal_builder(
+        talker_config=SimpleNamespace(
+            codec_nothink_id=10,
+            codec_think_bos_id=11,
+            codec_think_eos_id=12,
+            codec_think_id=13,
+            codec_language_id={},
+            codec_pad_id=7,
+            codec_bos_id=8,
+            num_code_groups=2,
+            spk_is_dialect={},
+            spk_id={"maya_warm": 99, "ryan": 100},
+        )
+    )
+    device_param = torch.nn.Parameter(torch.empty(0))
+    builder._text_embedding = _stub_text_embedding(device_param)
+    builder._text_projection = lambda embeds: embeds
+    codec_ids = []
+
+    def _codec_embed(ids):
+        codec_ids.append(ids.detach().cpu().tolist())
+        return torch.zeros((*ids.shape, 4), device=ids.device)
+
+    builder._codec_embed = _codec_embed
+
+    class FakeTokenizer:
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": torch.arange(8, dtype=torch.long).reshape(1, -1)}
+
+    builder._text_tokenizer = FakeTokenizer()
+    builder._generate_icl_prompt = lambda **kwargs: (
+        torch.ones((1, 2, 4), device=kwargs["ref_code"].device),
+        torch.ones((1, 4), device=kwargs["ref_code"].device),
+    )
+    builder.normalize_ref_audio = lambda _raw: (_ for _ in ()).throw(AssertionError("normalize not expected"))
+    builder.extract_speaker_embedding = lambda _wav, _sr: (_ for _ in ()).throw(
+        AssertionError("speaker extraction not expected")
+    )
+    ref_code = torch.arange(4, dtype=torch.long).reshape(2, 2)
+
+    _prompt, _trailing, ref_code_len, out_ref_code = builder.build_prompt_embeds(
+        task_type="Base",
+        info_dict={
+            "text": ["hello"],
+            "ref_ids": torch.arange(8, dtype=torch.long).reshape(1, -1),
+            "non_streaming_mode": [False],
+            "voice_clone_prompt": {
+                "ref_code": ref_code,
+                "speaker_anchor": {"kind": "voice", "voice": "MAYA_WARM"},
+                "icl_mode": True,
+            },
+        },
+    )
+
+    assert [99] in codec_ids
+    assert [100] not in codec_ids
+    assert ref_code_len == 2
+    assert torch.equal(out_ref_code, ref_code)
+
+
 def test_ref_audio_artifact_only_uses_cache_without_ref_audio_payload():
     builder = _make_minimal_builder()
     device_param = torch.nn.Parameter(torch.empty(0))

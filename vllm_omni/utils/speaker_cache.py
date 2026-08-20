@@ -138,19 +138,22 @@ def _validate_qwen3_tts_profile(
     expected_embedding_dim: int | None,
 ) -> str | None:
     # Successful validation also normalizes/augments `profile` for serving metadata.
-    speaker_embedding = tensors.get("speaker_embedding")
-    if not isinstance(speaker_embedding, torch.Tensor):
-        return "missing required tensor `speaker_embedding`"
-
-    embedding_dim = int(speaker_embedding.reshape(-1).numel())
-    if expected_embedding_dim and embedding_dim != expected_embedding_dim:
-        return f"speaker_embedding dim={embedding_dim}, expected={expected_embedding_dim}"
-
     mode = str(profile.get("mode") or "xvec").lower()
     if mode not in ("xvec", "icl"):
         return f"invalid mode={mode!r}; expected 'xvec' or 'icl'"
     profile["mode"] = mode
-    profile["embedding_dim"] = embedding_dim
+
+    speaker_embedding = tensors.get("speaker_embedding")
+    speaker_anchor_voice = str(profile.get("speaker_anchor_voice") or "").strip().lower()
+    if isinstance(speaker_embedding, torch.Tensor):
+        embedding_dim = int(speaker_embedding.reshape(-1).numel())
+        if expected_embedding_dim and embedding_dim != expected_embedding_dim:
+            return f"speaker_embedding dim={embedding_dim}, expected={expected_embedding_dim}"
+        profile["embedding_dim"] = embedding_dim
+    elif mode == "icl" and speaker_anchor_voice:
+        profile["speaker_anchor_voice"] = speaker_anchor_voice
+    else:
+        return "missing required tensor `speaker_embedding` or ICL `speaker_anchor_voice`"
 
     if mode == "icl":
         ref_code = tensors.get("ref_code")

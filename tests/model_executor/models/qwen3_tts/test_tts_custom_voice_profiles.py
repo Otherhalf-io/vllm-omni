@@ -62,6 +62,52 @@ def test_qwen3_custom_voice_profiles_warm_speaker_cache(tmp_path):
     torch.testing.assert_close(cached["ref_code"], torch.arange(6, dtype=torch.int32).reshape(3, 2))
 
 
+def test_qwen3_anchored_icl_profiles_remain_isolated(tmp_path):
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
+        Qwen3TTSTalkerForConditionalGeneration,
+    )
+
+    save_file({"ref_code": torch.full((3, 2), 11, dtype=torch.int32)}, str(tmp_path / "maya.safetensors"))
+    save_file({"ref_code": torch.full((2, 2), 22, dtype=torch.int32)}, str(tmp_path / "other.safetensors"))
+    _write_manifest(
+        tmp_path,
+        model_type="qwen3_tts",
+        voices={
+            "Maya": {
+                "file": "maya.safetensors",
+                "mode": "icl",
+                "ref_text": "maya reference",
+                "speaker_anchor_voice": "maya_warm",
+            },
+            "Other": {
+                "file": "other.safetensors",
+                "mode": "icl",
+                "ref_text": "other reference",
+                "speaker_anchor_voice": "ryan",
+            },
+        },
+    )
+
+    model = Qwen3TTSTalkerForConditionalGeneration.__new__(Qwen3TTSTalkerForConditionalGeneration)
+    model.config = SimpleNamespace(
+        custom_voice_dir=str(tmp_path),
+        speaker_encoder_config=SimpleNamespace(enc_dim=4),
+    )
+    model._speaker_cache = SpeakerEmbeddingCache()
+
+    model._load_custom_voice_profiles()
+
+    maya_key = model._speaker_cache.make_cache_key("maya", model_type="qwen3_tts_icl", created_at=0)
+    other_key = model._speaker_cache.make_cache_key("other", model_type="qwen3_tts_icl", created_at=0)
+    maya = model._speaker_cache.get(maya_key)
+    other = model._speaker_cache.get(other_key)
+    assert maya is not None and other is not None
+    assert maya["speaker_anchor"] == {"kind": "voice", "voice": "maya_warm"}
+    assert other["speaker_anchor"] == {"kind": "voice", "voice": "ryan"}
+    assert torch.equal(maya["ref_code"], torch.full((3, 2), 11, dtype=torch.int32))
+    assert torch.equal(other["ref_code"], torch.full((2, 2), 22, dtype=torch.int32))
+
+
 def test_qwen3_icl_profile_without_ref_code_is_not_downgraded(tmp_path):
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_talker import (
         Qwen3TTSTalkerForConditionalGeneration,

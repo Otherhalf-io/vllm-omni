@@ -1138,6 +1138,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                         voice_clone_prompt = {
                             "ref_code": ref_code_cached,
                             "ref_spk_embedding": ref_spk_embed_cached,
+                            "speaker_anchor": _cached.get("speaker_anchor"),
                             "icl_mode": _cached.get("icl_mode"),
                             "ref_text": _cached.get("ref_text"),
                         }
@@ -1191,12 +1192,29 @@ class Qwen3TTSPromptEmbedsBuilder:
             # destructively unwrap to a single scalar.
             speaker_dtype = self._embedding_dtype
             spk = None
+            speaker_anchor = None
             if voice_clone_prompt is not None:
                 spk = voice_clone_prompt.get("ref_spk_embedding")
+                speaker_anchor = voice_clone_prompt.get("speaker_anchor")
             if isinstance(spk, torch.Tensor):
                 speaker_embed = spk.to(device=input_ids.device, dtype=speaker_dtype).view(1, 1, -1)
             elif isinstance(spk, (list, np.ndarray)):
                 speaker_embed = torch.tensor(spk, dtype=speaker_dtype, device=input_ids.device).view(1, 1, -1)
+            elif isinstance(speaker_anchor, dict) and speaker_anchor.get("kind") == "voice":
+                speaker = str(speaker_anchor.get("voice") or "").lower().strip()
+                if not speaker:
+                    raise ValueError("Base speaker_anchor requires non-empty voice.")
+                spk_id_map = getattr(self._talker_config, "spk_id", None)
+                if spk_id_map is None:
+                    spk_id_map = getattr(self._talker_config, "speaker_id", None)
+                if not isinstance(spk_id_map, Mapping):
+                    spk_id_map = {}
+                normalized_spk_ids = {key.lower(): value for key, value in spk_id_map.items() if isinstance(key, str)}
+                if speaker not in normalized_spk_ids:
+                    raise ValueError(f"Unsupported speaker anchor: {speaker}")
+                speaker_token = torch.tensor([normalized_spk_ids[speaker]], device=input_ids.device, dtype=torch.long)
+                speaker_embed = self._codec_embed(speaker_token).reshape(1, 1, -1)
+                speaker_embed = speaker_embed.to(dtype=speaker_dtype)
             elif cached_artifacts is not None and isinstance(cached_artifacts.get("ref_spk_embedding"), torch.Tensor):
                 speaker_embed = (
                     cached_artifacts["ref_spk_embedding"]
