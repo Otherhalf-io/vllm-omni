@@ -1,0 +1,112 @@
+name: Release Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel"
+        required: true
+        type: choice
+        default: "preview"
+        options:
+          - preview
+          - stable
+      ref:
+        description: "Git ref to build. Stable releases must use main."
+        required: true
+        type: string
+        default: "main"
+concurrency:
+  group: release-image-${{ inputs.channel }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: us-central1-docker.pkg.dev/withcolor-dev/color
+  IMAGE_NAME: vllm-omni
+
+jobs:
+  build:
+    name: Build ${{ inputs.channel }} image
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      RELEASE_CHANNEL: ${{ inputs.channel }}
+      RELEASE_REF: ${{ inputs.ref }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Guard stable releases
+        run: |
+          if [[ "${RELEASE_CHANNEL}" == "stable" && "${RELEASE_REF}" != "main" && "${RELEASE_REF}" != "refs/heads/main" ]]; then
+            echo "::error::Stable vllm-omni releases must build main."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Resolve source identity and image tags
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 .github/scripts/resolve_color_release.py \
+            --channel "${RELEASE_CHANNEL}" \
+            --image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Build and push image
+        id: image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: docker/Dockerfile.cuda
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.release.outputs.immutable_image }}
+          build-args: |
+            BASE_IMAGE=${{ steps.release.outputs.base_image }}
+            VLLM_OMNI_VERSION_OVERRIDE=${{ steps.release.outputs.version_override }}
+            VLLM_OMNI_SOURCE_SHA=${{ steps.release.outputs.full_sha }}
+
+      - name: Summary
+        env:
+          RELEASE_BASE_COMMIT: ${{ steps.release.outputs.upstream_base_commit }}
+          RELEASE_BASE_IMAGE: ${{ steps.release.outputs.base_image }}
+          RELEASE_BASE_VERSION: ${{ steps.release.outputs.upstream_base_version }}
+          RELEASE_DIGEST: ${{ steps.image.outputs.digest }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.immutable_image }}
+          RELEASE_SOURCE_SHA: ${{ steps.release.outputs.full_sha }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version_override }}
+        run: |
+          {
+            echo "## vllm-omni image release"
+            echo ""
+            echo "| field | value |"
+            echo "|---|---|"
+            printf "| channel | \`%s\` |\n" "${RELEASE_CHANNEL}"
+            printf "| ref | \`%s\` |\n" "${RELEASE_REF}"
+            printf "| source SHA | \`%s\` |\n" "${RELEASE_SOURCE_SHA}"
+            printf "| installed version | \`%s\` |\n" "${RELEASE_VERSION}"
+            printf "| upstream base | \`%s@%s\` |\n" "${RELEASE_BASE_VERSION}" "${RELEASE_BASE_COMMIT}"
+            printf "| base image | \`%s\` |\n" "${RELEASE_BASE_IMAGE}"
+            printf "| immutable image | \`%s\` |\n" "${RELEASE_IMAGE}"
+            printf "| digest | \`%s\` |\n" "${RELEASE_DIGEST}"
+            printf "| deployable reference | \`%s@%s\` |\n" "${RELEASE_IMAGE}" "${RELEASE_DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
