@@ -73,6 +73,7 @@ def test_voice_001(omni_server, openai_client) -> None:
     """
     request_config = {
         "model": omni_server.model,
+        "request_id": "e2e-qwen3-customvoice-expansion",
         "input": get_prompt(),
         "stream": True,
         "stream_format": "audio",

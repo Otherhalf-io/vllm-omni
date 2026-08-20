@@ -2103,6 +2103,7 @@ class OpenAIClientHandler:
             "speed",
             "stream_format",
             "x_vector_only_mode",
+            "request_id",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]
@@ -2215,6 +2216,9 @@ class OpenAIClientHandler:
 
                 def _stream_task(request_idx: int):
                     wall_start = time.perf_counter()
+                    request_extra_body = dict(extra_body)
+                    if "request_id" in request_extra_body:
+                        request_extra_body["request_id"] = f"{request_extra_body['request_id']}-{request_idx}"
                     with self.client.audio.speech.with_streaming_response.create(
                         model=model,
                         input=text_input,
@@ -2252,6 +2256,9 @@ class OpenAIClientHandler:
 
                 def _non_stream_task(request_idx: int):
                     wall_start = time.perf_counter()
+                    request_extra_body = dict(extra_body)
+                    if "request_id" in request_extra_body:
+                        request_extra_body["request_id"] = f"{request_extra_body['request_id']}-{request_idx}"
                     r = self.client.audio.speech.create(
                         model=model,
                         input=text_input,

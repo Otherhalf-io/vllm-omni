@@ -73,5 +73,5 @@ def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:
     Input Setting: stream=False
     Datasets: few requests
     """
-    request_config = {"input": get_prompt(), "voice": "vivian"}
+    request_config = {"request_id": "e2e-offline-qwen3-customvoice", "input": get_prompt(), "voice": "vivian"}
     omni_runner_handler.send_audio_speech_request(request_config)
