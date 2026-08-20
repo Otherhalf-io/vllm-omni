@@ -1,0 +1,8 @@
+-r ../../requirements/common.txt
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-mock==3.15.1
+vllm==0.26.0
+
+pyOpenSSL==25.1.0

@@ -60,3 +60,30 @@ jobs:
             --with safetensors \
             pytest -q -c /dev/null -p no:cacheprovider \
               --confcutdir=tests/color_contracts --maxfail=1 "${tests[@]}"
+
+      - name: Run CustomVoice admission contract
+        if: ${{ hashFiles('tests/entrypoints/openai_api/test_custom_voice_default_contract.py') != '' }}
+        run: |
+          set -euo pipefail
+          uv run \
+            --no-project \
+            --python 3.12 \
+            --with pytest \
+            pytest -q -c /dev/null -p no:cacheprovider \
+              --confcutdir=tests/entrypoints/openai_api --maxfail=1 \
+              tests/entrypoints/openai_api/test_custom_voice_default_contract.py
+
+      - name: Run CustomVoice point-of-use regression
+        if: ${{ hashFiles('tests/entrypoints/openai_api/test_custom_voice_point_of_use.py') != '' }}
+        env:
+          PYTHONPATH: .
+          UV_TORCH_BACKEND: cpu
+        run: |
+          set -euo pipefail
+          uv run \
+            --no-project \
+            --python 3.12 \
+            --with-requirements .github/requirements/color-serving-tests.txt \
+            pytest -q -c /dev/null -p no:cacheprovider \
+              --confcutdir=tests/entrypoints/openai_api --maxfail=1 \
+              tests/entrypoints/openai_api/test_custom_voice_point_of_use.py
