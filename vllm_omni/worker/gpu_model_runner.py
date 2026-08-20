@@ -1542,6 +1542,20 @@ class OmniGPUModelRunner(GPUModelRunner):
             device=device,
         )
 
+    def _preprocess_request_isolated(
+        self,
+        *,
+        req_id: str,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+        req_infos: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        return self.model.preprocess(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            **req_infos,
+        )
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1771,10 +1785,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                 flush_decode_batch()
 
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                req_input_ids, req_embeds, update_dict = self._preprocess_request_isolated(
+                    req_id=req_id,
                     input_ids=preprocess_input_ids[s:e],
                     input_embeds=embed_slice,
-                    **req_infos,
+                    req_infos=req_infos,
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(

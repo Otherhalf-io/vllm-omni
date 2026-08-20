@@ -1188,3 +1188,75 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
 
     assert torch.equal(output.inter_stage_outputs[0]["codes.ref"], ref_codes[0])
     assert torch.equal(output.inter_stage_outputs[2]["codes.ref"], ref_codes[2])
+
+
+def test_request_input_error_is_isolated_and_next_request_continues() -> None:
+    from vllm_omni.errors import RequestInputError
+
+    calls: list[str] = []
+
+    def preprocess(*, input_ids, input_embeds, request_id, **_kwargs):
+        calls.append(request_id)
+        if request_id == "bad":
+            raise RequestInputError("malformed voice")
+        return input_ids, input_embeds + 1, {"processed": True}
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(preprocess=preprocess)
+    runner._request_preprocessing_errors = {}
+    input_ids = torch.tensor([1], dtype=torch.long)
+    input_embeds = torch.tensor([[2.0, 3.0]])
+
+    bad_ids, bad_embeds, bad_update = runner._preprocess_request_isolated(
+        req_id="bad",
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        req_infos={"request_id": "bad"},
+    )
+    good_ids, good_embeds, good_update = runner._preprocess_request_isolated(
+        req_id="good",
+        input_ids=input_ids,
+        input_embeds=input_embeds,
+        req_infos={"request_id": "good"},
+    )
+
+    assert calls == ["bad", "good"]
+    assert torch.equal(bad_ids, input_ids)
+    assert torch.equal(bad_embeds, input_embeds)
+    assert bad_update == {}
+    assert runner._request_preprocessing_errors["bad"].message == "malformed voice"
+    assert runner._request_preprocessing_errors["bad"].status_code == 400
+    assert runner._request_preprocessing_errors["bad"].error_type == "BadRequestError"
+    assert torch.equal(good_ids, input_ids)
+    assert torch.equal(good_embeds, input_embeds + 1)
+    assert good_update == {"processed": True}
+
+
+@pytest.mark.parametrize("error", [ValueError("plain value error"), RuntimeError("unexpected runtime error")])
+def test_untyped_preprocessing_errors_remain_fatal(error: Exception) -> None:
+    def preprocess(**_kwargs):
+        raise error
+
+    runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace(preprocess=preprocess)
+    runner._request_preprocessing_errors = {}
+
+    with pytest.raises(type(error), match=str(error)):
+        runner._preprocess_request_isolated(
+            req_id="request",
+            input_ids=torch.tensor([1], dtype=torch.long),
+            input_embeds=torch.tensor([[1.0]]),
+            req_infos={},
+        )
+
+    assert runner._request_preprocessing_errors == {}
+
+
+def test_qwen_prompt_builder_classifies_malformed_ref_audio() -> None:
+    from vllm_omni.errors import RequestInputError
+    from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import Qwen3TTSPromptEmbedsBuilder
+
+    builder = object.__new__(Qwen3TTSPromptEmbedsBuilder)
+
+    with pytest.raises(RequestInputError, match="missing sample_rate"):
+        builder.normalize_ref_audio([0.0] * 1024)

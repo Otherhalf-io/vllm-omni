@@ -38,6 +38,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.multimodal.audio import AudioResampler
 
+from vllm_omni.errors import RequestInputError
 from vllm_omni.utils.audio import mel_filter_bank
 
 if TYPE_CHECKING:
@@ -516,7 +517,7 @@ class Qwen3TTSPromptEmbedsBuilder:
 
         _scan(ref_audio)
         if not sr_candidates:
-            raise TypeError(f"ref_audio missing sample_rate: {_summarize(ref_audio)}")
+            raise RequestInputError(f"ref_audio missing sample_rate: {_summarize(ref_audio)}")
         sr = int(sr_candidates[0])
 
         def _wav_len(x: object) -> int:
@@ -532,7 +533,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             return 0
 
         if not wav_candidates:
-            raise TypeError(f"ref_audio missing waveform: {_summarize(ref_audio)}")
+            raise RequestInputError(f"ref_audio missing waveform: {_summarize(ref_audio)}")
         wav_obj = max(wav_candidates, key=_wav_len)
 
         def _to_np(x: object) -> np.ndarray:
@@ -557,11 +558,11 @@ class Qwen3TTSPromptEmbedsBuilder:
                         parts.append(_to_np(part))
                 if parts:
                     return np.concatenate(parts, axis=0)
-            raise TypeError(f"Unsupported waveform type: {type(x)}")
+            raise RequestInputError(f"Unsupported waveform type: {type(x)}")
 
         wav_np = _to_np(wav_obj)
         if wav_np.size < 1024:
-            raise ValueError(f"ref_audio waveform too short: {wav_np.size} samples")
+            raise RequestInputError(f"ref_audio waveform too short: {wav_np.size} samples")
         return wav_np, sr
 
     # -------------------- ref-audio artifact cache --------------------
@@ -1069,7 +1070,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                         return ref_audio_wav, ref_audio_sr
                     ref_audio_list = info_dict.get("ref_audio")
                     if not isinstance(ref_audio_list, list) or not ref_audio_list:
-                        raise ValueError("Base requires `ref_audio`.")
+                        raise RequestInputError("Base requires `ref_audio`.")
                     ref_audio_wav, ref_audio_sr = self.normalize_ref_audio(ref_audio_list[0])
                 return ref_audio_wav, ref_audio_sr
 
@@ -1147,7 +1148,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             if voice_clone_prompt is None and _speaker_cache_key is not None:
                 ref_audio_list = info_dict.get("ref_audio")
                 if not isinstance(ref_audio_list, list) or not ref_audio_list:
-                    raise ValueError(
+                    raise RequestInputError(
                         f"Qwen3-TTS speaker '{_cache_lookup_voice}' was requested without ref_audio, "
                         "but no precomputed cache entry was loaded"
                     )
@@ -1203,7 +1204,7 @@ class Qwen3TTSPromptEmbedsBuilder:
             elif isinstance(speaker_anchor, dict) and speaker_anchor.get("kind") == "voice":
                 speaker = str(speaker_anchor.get("voice") or "").lower().strip()
                 if not speaker:
-                    raise ValueError("Base speaker_anchor requires non-empty voice.")
+                    raise RequestInputError("Base speaker_anchor requires non-empty voice.")
                 spk_id_map = getattr(self._talker_config, "spk_id", None)
                 if spk_id_map is None:
                     spk_id_map = getattr(self._talker_config, "speaker_id", None)
@@ -1211,7 +1212,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     spk_id_map = {}
                 normalized_spk_ids = {key.lower(): value for key, value in spk_id_map.items() if isinstance(key, str)}
                 if speaker not in normalized_spk_ids:
-                    raise ValueError(f"Unsupported speaker anchor: {speaker}")
+                    raise RequestInputError(f"Unsupported speaker anchor: {speaker}")
                 speaker_token = torch.tensor([normalized_spk_ids[speaker]], device=input_ids.device, dtype=torch.long)
                 speaker_embed = self._codec_embed(speaker_token).reshape(1, 1, -1)
                 speaker_embed = speaker_embed.to(dtype=speaker_dtype)
@@ -1330,10 +1331,10 @@ class Qwen3TTSPromptEmbedsBuilder:
                 ((_speaker_raw[0] if isinstance(_speaker_raw, (list, tuple)) else _speaker_raw) or "").lower().strip()
             )
             if not speaker:
-                raise ValueError("CustomVoice requires additional_information.speaker.")
+                raise RequestInputError("CustomVoice requires additional_information.speaker.")
             spk_id_map = {k.lower(): v for k, v in (getattr(talker_config, "spk_id", None) or {}).items()}
             if speaker not in spk_id_map:
-                raise ValueError(f"Unsupported speaker: {speaker}")
+                raise RequestInputError(f"Unsupported speaker: {speaker}")
             spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
@@ -1417,7 +1418,7 @@ class Qwen3TTSPromptEmbedsBuilder:
                     dim=1,
                 )
         else:
-            raise ValueError(f"Unsupported task_type={task_type}")
+            raise RequestInputError(f"Unsupported task_type={task_type}")
 
         if instruct_embed is not None:
             talker_prompt = torch.cat([instruct_embed, talker_prompt], dim=1)

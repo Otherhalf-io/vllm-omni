@@ -33,6 +33,10 @@ class OmniClientError(ValueError):
         self.error_type = error_type
 
 
+class RequestInputError(OmniClientError):
+    """Deterministic malformed input detected during request preprocessing."""
+
+
 class GuardrailViolationError(OmniClientError):
     """Raised when a model guardrail rejects request content."""
 

@@ -264,3 +264,63 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     assert output_by_id["bad"].new_token_ids == []
     assert output_by_id["good"].new_token_ids == [8]
     np.testing.assert_array_equal(output_by_id["good"].new_logprobs.logprob_token_ids[:, 0], [8])
+
+
+def test_preprocessing_error_frees_request_and_removes_it_from_running() -> None:
+    """Malformed input must terminate without retaining scheduler resources."""
+    from vllm_omni.outputs import RequestPreprocessingError
+
+    bad = _Request("bad")
+    good = _Request("good")
+    good.sampling_params = SimpleNamespace(num_logprobs=None)
+    scheduler = _make_scheduler_stub([bad, good])
+    freed_blocks: list[str] = []
+    freed_encoder: list[str] = []
+    scheduler._omits_kv_transfer_cache = {}
+    scheduler._inflight_prefills = set()
+    scheduler._connector_finished = lambda _request: (False, None)
+    scheduler.encoder_cache_manager = SimpleNamespace(free=lambda request: freed_encoder.append(request.request_id))
+    scheduler._should_transfer_kv_for_request = lambda _request_id: False
+    scheduler._free_blocks = lambda request: freed_blocks.append(request.request_id)
+    scheduler._free_input_coordinator_request = lambda _request_id: None
+    scheduler.chunk_transfer_adapter = None
+    scheduler._free_request = MethodType(OmniARScheduler._free_request, scheduler)
+    scheduler._update_request_with_output = lambda request, token_ids: (token_ids, False)
+    scheduler._process_kv_transfer_trigger = lambda _request, _tokens: False
+    scheduler._handle_stopped_request = lambda _request: True
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"bad": 1, "good": 1},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=[[8]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"good": 0},
+        routed_experts=None,
+        preprocessing_errors={
+            "bad": RequestPreprocessingError(
+                message="malformed voice",
+                status_code=400,
+                error_type="BadRequestError",
+            )
+        },
+    )
+
+    outputs = OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+    output_by_id = {output.request_id: output for output in outputs[0].outputs}
+
+    assert freed_blocks == ["bad"]
+    assert freed_encoder == ["bad"]
+    assert bad not in scheduler.running
+    assert good in scheduler.running
+    assert "bad" in scheduler.finished_req_ids
+    assert output_by_id["bad"].finish_reason is FinishReason.ERROR
+    assert output_by_id["bad"].preprocessing_error == "malformed voice"
+    assert output_by_id["good"].new_token_ids == [8]
