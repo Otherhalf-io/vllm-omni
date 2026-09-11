@@ -3,12 +3,19 @@ FROM ${BASE_IMAGE}
 
 ARG BASE_IMAGE
 ARG COMMON_WORKDIR=/app
+ARG OS_SECURITY_UPDATE_EPOCH=2026-09-10
+ARG MIN_LINUX_LIBC_DEV_VERSION=5.15.0-191.201
 
 WORKDIR ${COMMON_WORKDIR}
 
-# Step 1: Setup - Install system dependencies
-RUN apt-get update && \
-    apt-get install -y git jq && \
+# vLLM compiles GPU kernels at runtime, so the final image must retain current
+# userspace kernel headers even though it never loads host kernel modules.
+RUN test -n "${OS_SECURITY_UPDATE_EPOCH}" && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends git jq linux-libc-dev && \
+    installed_linux_libc_dev_version="$(dpkg-query -W -f='${Version}' linux-libc-dev)" && \
+    dpkg --compare-versions \
+        "${installed_linux_libc_dev_version}" ge "${MIN_LINUX_LIBC_DEV_VERSION}" && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

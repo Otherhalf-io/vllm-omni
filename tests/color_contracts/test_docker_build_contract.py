@@ -24,6 +24,16 @@ def test_cuda_image_requires_explicit_source_identity() -> None:
     assert cuda_installation.count("--build-arg VLLM_OMNI_SOURCE_SHA=") == 2
 
 
+def test_cuda_image_requires_current_runtime_kernel_headers() -> None:
+    dockerfile = (_REPO_ROOT / "docker/Dockerfile.cuda").read_text()
+
+    assert "ARG OS_SECURITY_UPDATE_EPOCH=2026-09-10" in dockerfile
+    assert "ARG MIN_LINUX_LIBC_DEV_VERSION=5.15.0-191.201" in dockerfile
+    assert "apt-get install -y --no-install-recommends git jq linux-libc-dev" in dockerfile
+    assert "dpkg-query -W -f='${Version}' linux-libc-dev" in dockerfile
+    assert '"${installed_linux_libc_dev_version}" ge "${MIN_LINUX_LIBC_DEV_VERSION}"' in dockerfile
+
+
 def test_release_workflow_uses_repository_provenance_and_immutable_tags() -> None:
     workflow = (_REPO_ROOT / ".github/workflows/release-image.yml").read_text()
 
